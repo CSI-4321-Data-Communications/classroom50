@@ -1,1 +1,29 @@
 # classroom50
+
+Configuration repo for a Classroom 50 teaching organization.
+
+This repo holds:
+
+- Per-classroom directories (created by `gh teacher classroom add`):
+  - `classroom.json` — name, term, org (public)
+  - `assignments.json` — assignment manifest with optional per-entry `runtime` block (semi-public; published via GitHub Pages)
+  - `students.csv` — roster (private). Columns: `username,first_name,last_name,email,section,github_id`. The `email` column is optional per row; `github_id` is CLI-managed (populated by `gh teacher roster add/import` from `GET /users/{username}`) and should not be hand-edited.
+  - `scores.json` — collected submission scores (private)
+  - `autograder.py` (optional, classroom default) — set via `gh teacher autograder set-default`. Used by every assignment in the classroom that doesn't have its own override. Absent by default — submissions still tag and publish releases (vacuous-pass `result.json`) when no autograder is configured.
+  - `autograders/<slug>/` (optional, per-assignment) — entrypoint `autograder.py` plus any sibling fixtures, helpers, or framework configs. Bundled as `<slug>.tar.gz` by `publish-pages.yaml` and downloaded by the runner-side bootstrap at workflow runtime. Takes precedence over the classroom default.
+  - `autograders/<name>.yaml` (optional, rare) — non-default autograder shim referenced via `gh teacher assignment add --autograder <name>`. Used when an assignment needs a different *reusable workflow* entirely; for different language toolchains or apt packages, edit the `runtime:` block on the assignment instead.
+- `.github/scripts/` (org-level, shared across all classrooms in this repo; nested under `.github/` so the directory name can't collide with a classroom slug):
+  - `runner.py` — runner-side bootstrap fetched from Pages on every submission. Downloads the per-assignment bundle, resolves the entrypoint (per-assignment override → classroom default `<classroom>/autograder.py` → vacuous-pass synthesis), execs it with `cwd` at the student's checkout, validates the v1 `result.json` it produces. Teachers don't normally edit this file.
+  - `collect_scores.py` -- score collector. Roster-driven: walks every `(student, assignment)` pair from `<classroom>/students.csv` x `<classroom>/assignments.json` and asks GitHub for that pair's `<classroom>-<assignment>-<username>` repo's latest release. Each release carries a `result.json` asset (produced by the autograder); the collector schema-validates it, checks the embedded `(classroom, assignment, username)` triple against the source repo's expected identity, and upserts it into `<classroom>/scores.json` under that assignment's bucket -- `submissions` is keyed by assignment slug, and the now-redundant `assignment` field is dropped from each stored row (a `scores.json` still in the legacy flat-array layout is migrated to the map on the next run). Honors `"override": true` so teacher manual corrections never get overwritten. Per-classroom writes are atomic (`scores.json.tmp` -> `os.replace`). A 404 from any expected repo's latest-release endpoint is not an error -- it just means the student hasn't accepted or submitted yet; the collector logs a per-assignment "X of Y submitted" summary so teachers see roster coverage at a glance.
+- `.github/workflows/`:
+  - `autograde-runner.yaml` — reusable workflow called by every student-repo autograde shim. Reads `.classroom50.yaml` + the assignment's `runtime` block, decides the runner OS / container / language toolchains, fetches `runner.py` from Pages (published from `.github/scripts/runner.py`), runs it, posts the commit status, and publishes the submit-tag release.
+  - `publish-pages.yaml` — builds the Pages site from an allow-list of paths (`runner.py` at the site root, per-classroom JSON, per-classroom `autograder.py` defaults, autograder shim YAMLs, per-assignment bundles).
+  - `collect-scores.yaml` — teacher-triggered (manual via `workflow_dispatch`, nightly via cron). Calls `.github/scripts/collect_scores.py`, then commits any updated `*/scores.json` files back to the repo.
+
+Bootstrapped by `gh teacher init <org>`. From there:
+
+- `gh teacher classroom add <org> <short-name>` — scaffold a new classroom directory (the four config files above; the per-classroom `autograder.py` and per-assignment `autograders/<slug>/` folders fill in over time as needed).
+- `gh teacher roster add|remove|import <org> <classroom> ...` — manage `students.csv` (and auto-invite new students to the org).
+- `gh teacher assignment add|remove <org> <classroom> <slug>` — register or drop an assignment in `assignments.json`. Pass `--runtime <path>` for per-assignment runtime customization (Python version, language toolchains, apt packages, container image). Pass `--autograder <name>` only when swapping the entire reusable workflow (rare). Per-assignment grading is NOT registered through this command — drop an `autograder.py` (plus any sibling fixtures) at `<classroom>/autograders/<slug>/`, or run `gh teacher autograder set-default <org> <classroom>` to install a classroom default.
+- `gh teacher autograder set-default <org> <classroom>` — install a classroom default `autograder.py` at `<classroom>/autograder.py`. With `--from <path>`, uploads the given Python source. Without `--from`, drops a diagnostic stub for verifying the runner pipeline.
+- `gh teacher assignment list <org> <classroom>` — print every assignment slug registered in a classroom (`--json` for the full entries array).
