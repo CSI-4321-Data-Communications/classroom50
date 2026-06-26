@@ -33,6 +33,17 @@
       },
       "mode": "individual",
       "autograder": "default"
+    },
+    {
+      "slug": "project3",
+      "name": "Project 3",
+      "template": {
+        "owner": "CSI-4321-Data-Communications",
+        "repo": "Project3",
+        "branch": "main"
+      },
+      "mode": "individual",
+      "autograder": "default"
     }
   ]
 }
