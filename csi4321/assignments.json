@@ -11,6 +11,17 @@
       },
       "mode": "individual",
       "autograder": "default"
+    },
+    {
+      "slug": "project1",
+      "name": "Project 1",
+      "template": {
+        "owner": "CSI-4321-Data-Communications",
+        "repo": "Project1",
+        "branch": "main"
+      },
+      "mode": "individual",
+      "autograder": "default"
     }
   ]
 }
