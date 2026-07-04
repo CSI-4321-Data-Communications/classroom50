@@ -2,15 +2,24 @@
 """Teacher-triggered scores collector.
 
 Walks roster × assignment manifest: for each (student, assignment)
-pair, fetches the canonical `<classroom>-<assignment>-<username>`
-repo's latest release, validates the `result.json` asset, and
+pair, pages through the canonical `<classroom>-<assignment>-<username>`
+repo's `submit/*` releases, validates each `result.json` asset, and
 upserts into `<classroom>/scores.json`.
 
-`scores.json` groups rows by assignment: `submissions` is an object
-keyed by assignment slug, each value the list of that assignment's
-rows. A stored row is the validated `result.json` payload with the
-now-redundant `assignment` field dropped (it's the bucket key);
-everything else, including `schema` and `tests`, is kept verbatim.
+`scores.json` is keyed by assignment slug under the root `assignments`
+object: each value is `{ "type": "individual"|"group", "entries": [...] }`.
+An `entry` is one student repo's gradebook record (one per repo owner):
+identity/keying at the top level (`owner`; plus `member_usernames` for a
+group entry — the credited roster collaborators) and the full
+per-submission history inside a `submissions` list (newest first). Each
+`submissions` item is a validated `result.json` payload (minus the
+redundant `assignment` bucket key; it carries `owner` + `assignment_type`
++ optional `submitted_by`, no `usernames`), so every push to `main` that
+produced a `submit/*` release is retained — not just the latest. When the
+assignment has a `due` date in assignments.json, each submission record
+carries `"late": true|false` (its `datetime` vs. `due`). Advisory only —
+nothing enforces the deadline; late submissions are still collected and
+scored.
 
 Single writer per scores.json. Re-runs are idempotent: unchanged
 submissions are no-ops, and `"override": true` entries are
@@ -21,7 +30,9 @@ release is not an error (student hasn't accepted/submitted yet);
 the per-assignment "X of Y submitted" log shows roster coverage.
 
 Environment (set by `collect-scores.yaml`):
-  CLASSROOM50_COLLECT_TOKEN — fine-grained PAT, Contents: read.
+  CLASSROOM50_SERVICE_TOKEN — fine-grained PAT, Contents: Read and write.
+                              Collection only reads; the write scope is
+                              shared with regrade.yaml (pushes submit/* tags).
   CLASSROOM_FILTER          — optional single-classroom limit.
   GITHUB_REPOSITORY_OWNER   — org name (auto-set by Actions).
   GITHUB_API_URL            — API URL on GHES runners.
@@ -31,12 +42,13 @@ Exit codes:
   0 — success.
   1 — operational failure (missing token, malformed scores.json,
       unrecoverable network error). The run log points the teacher
-      at `gh teacher rotate-collect-token` for PAT issues.
+      at `gh teacher rotate-service-token` for PAT issues.
 """
 
 from __future__ import annotations
 
 import csv
+import datetime
 import json
 import os
 import pathlib
@@ -59,6 +71,11 @@ RESULT_SCHEMA_V1 = "classroom50/result/v1"
 # submissions (created by autograde-runner.yaml on push to `main`).
 SUBMIT_TAG_PREFIX = "submit/"
 
+RFC3339_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T([01]\d|2[0-3]):[0-5]\d:[0-5]\d"
+    r"(\.\d+)?(Z|[+-]([01]\d|2[0-3]):[0-5]\d)$"
+)
+
 # Release asset name written by the autograde runner. Cross-binary
 # contract — keep aligned with autograde-runner.yaml and download.go.
 RESULT_ASSET_NAME = "result.json"
@@ -68,18 +85,42 @@ RESULT_ASSET_NAME = "result.json"
 # submission.
 MAX_RESULT_BYTES = 10 * 1024 * 1024
 
-# When `/releases/latest` points at a non-submit release, scan a
-# bounded window for the newest submit-tag release.
-MAX_RELEASES_FALLBACK = 30
+# Required roster columns written by `gh teacher classroom add`. Mirrors
+# RosterColumns in cli/gh-teacher/internal/configrepo/students_csv.go. The
+# header must START with these (in order); the web app (classroom50-web)
+# appends optional onboarding columns after them, which the collector reads by
+# name (it only consumes `username` + `github_id`) and otherwise ignores.
+ROSTER_REQUIRED_COLUMNS = ("username", "first_name", "last_name", "email", "section", "github_id")
 
-# Roster header written by `gh teacher classroom add`. Mirrors
-# rosterColumns in cli/gh-teacher/students_csv.go.
-ROSTER_HEADER = ("username", "first_name", "last_name", "email", "section", "github_id")
+# Optional onboarding columns the web app appends after the required six.
+# Mirrors OnboardingColumns in the Go students_csv.go and the web app's
+# STUDENT_CSV_FIELDS tail. The collector ignores them (it reads only username +
+# github_id by name); they exist here so FULL_ROSTER_HEADER can pin the lockstep
+# across all three codebases. Keep them in sync.
+ROSTER_ONBOARDING_COLUMNS = (
+    "enrollment_status",
+    "enrollment_method",
+    "email_hash",
+    "invite_token",
+    "invited_at",
+    "enrolled_at",
+)
+
+# FULL_ROSTER_HEADER is the exact on-disk students.csv header written when all
+# onboarding columns are present. Must equal FullRosterHeader in the Go
+# students_csv.go (asserted by TestFullRosterHeader) and the web app's header.
+FULL_ROSTER_HEADER = ",".join(ROSTER_REQUIRED_COLUMNS + ROSTER_ONBOARDING_COLUMNS)
 
 # Coarse filter for obviously-bogus usernames (empty, slashes, etc.)
 # so they don't get formatted into a URL. Not a strict GitHub
 # username validator.
 _USERNAME_BAD_CHARS = re.compile(r"[^A-Za-z0-9-]")
+
+# Leading bytes that a spreadsheet (Excel/LibreOffice) treats as a formula
+# trigger. Mirrors isFormulaTrigger in students_csv.go; used to reject a
+# hand-edited extra column whose NAME would re-introduce CSV-injection when the
+# CLI rewrites the header verbatim.
+_CSV_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
 
 
 # Top-level dispatch ----------------------------------------------------------
@@ -94,9 +135,9 @@ def main() -> int:
         emit_error("GITHUB_REPOSITORY_OWNER is empty — this script must run inside a GitHub Actions workflow")
         return 1
 
-    collect_token = (os.environ.get("CLASSROOM50_COLLECT_TOKEN") or "").strip()
-    if not collect_token:
-        emit_error("CLASSROOM50_COLLECT_TOKEN is empty — run `gh teacher rotate-collect-token <org>` to provision it")
+    service_token = (os.environ.get("CLASSROOM50_SERVICE_TOKEN") or "").strip()
+    if not service_token:
+        emit_error("CLASSROOM50_SERVICE_TOKEN is empty — run `gh teacher rotate-service-token <org>` to provision it")
         return 1
 
     api_url = (
@@ -114,28 +155,40 @@ def main() -> int:
         return 0
 
     total_changes = 0
+    failed_classrooms: list[str] = []
     for classroom_short, _classroom_meta, assignments, roster in classroom_dirs:
         scores_path = base_dir / classroom_short / "scores.json"
         try:
             scores = load_scores(scores_path)
         except ScoresFileError as exc:
-            emit_error(str(exc))
-            return 1
+            # A malformed/hand-edited scores.json is a per-CLASSROOM data
+            # problem — isolate it (like iter_classrooms does for a bad
+            # classroom.json/students.csv) so one broken file can't deny
+            # collection to every other classroom in the run. The run still
+            # exits non-zero at the end so CI surfaces the failure.
+            emit_error(f"{classroom_short}: {exc}")
+            failed_classrooms.append(classroom_short)
+            continue
 
         try:
-            updates = collect_classroom(
+            updates, mode_flip_assignments = collect_classroom(
                 api_url=api_url,
                 org=org,
                 classroom_short=classroom_short,
                 assignments=assignments,
                 roster=roster,
-                collect_token=collect_token,
+                service_token=service_token,
             )
         except urllib.error.HTTPError as exc:
+            # Auth (401/403) and synthetic-network (599) failures are GLOBAL
+            # — the token is bad or GitHub is unreachable, so every remaining
+            # classroom would fail identically. Abort the whole run loudly
+            # rather than warn-and-skip per classroom (which would report a
+            # broken run as success that collected nothing).
             if exc.code in (401, 403):
                 emit_error(
-                    f"{classroom_short}: collect token was rejected with HTTP {exc.code} "
-                    f"({exc.reason or 'no reason'}) — run `gh teacher rotate-collect-token {org}` "
+                    f"{classroom_short}: service token was rejected with HTTP {exc.code} "
+                    f"({exc.reason or 'no reason'}) — run `gh teacher rotate-service-token {org}` "
                     f"with a fine-grained PAT scoped to Contents: read on the student repos"
                 )
             else:
@@ -145,12 +198,41 @@ def main() -> int:
                 )
             return 1
 
+        # A service token that can't read the student repos returns
+        # 404 for every repo (GitHub hides repo existence), which is
+        # indistinguishable from "not submitted" -- so collect_classroom
+        # reports the whole roster as unsubmitted and the run still exits
+        # cleanly (the 401/403 hard-fail guard never trips). When a
+        # non-empty roster x non-empty assignment set yields zero readable
+        # submissions, that almost always means the token lacks access,
+        # not that the entire class submitted nothing. Warn -- but don't
+        # fail: an early-term run legitimately collects zero.
+        #
+        # Suppress this when collect_classroom already attributed the empty
+        # result to a mode flip (releases present but all rejected by
+        # validation): that has its own loud, specific warning above, and
+        # blaming the token here would misdirect the teacher.
+        assignment_count = len(valid_assignment_slugs(assignments))
+        if assignment_count and roster and not updates and not mode_flip_assignments:
+            emit_warning(
+                f"{classroom_short}: collected 0 submissions across "
+                f"{len(roster)} student(s) x {assignment_count} assignment(s). "
+                f"If you expected submissions, the CLASSROOM50_SERVICE_TOKEN may "
+                f"lack read access to the student repos (a fine-grained PAT "
+                f"returns 404 for repos outside its scope, which is "
+                f'indistinguishable from "not submitted"). Re-scope it to all '
+                f"org repos: gh teacher rotate-service-token {org}"
+            )
+
         n_changes = apply_updates(scores, updates)
         try:
             save_scores(scores_path, scores)
         except ScoresFileError as exc:
-            emit_error(str(exc))
-            return 1
+            # Per-classroom write failure — isolate like the load failure
+            # above so a single unwritable file doesn't strand the rest.
+            emit_error(f"{classroom_short}: {exc}")
+            failed_classrooms.append(classroom_short)
+            continue
 
         print(f"{classroom_short}: {n_changes} updated submission(s)")
         total_changes += n_changes
@@ -159,6 +241,12 @@ def main() -> int:
         f"collect: {total_changes} total submission(s) updated across "
         f"{len(classroom_dirs)} classroom(s)"
     )
+    if failed_classrooms:
+        emit_error(
+            f"collect: {len(failed_classrooms)} classroom(s) failed and were skipped: "
+            f"{', '.join(failed_classrooms)} (the other classrooms were collected)"
+        )
+        return 1
     return 0
 
 
@@ -235,11 +323,41 @@ def read_students_csv(path: pathlib.Path) -> list[dict[str, str]]:
             if reader.fieldnames is None:
                 raise RosterFileError("students.csv is empty")
             header = tuple(reader.fieldnames)
-            if header != ROSTER_HEADER:
+            # Tolerate trailing extras (the web app's onboarding columns): the
+            # collector reads username + github_id by name. A renamed/short/
+            # shuffled required prefix is still rejected so a hand-edit can't
+            # silently drop or shift roster data.
+            if header[: len(ROSTER_REQUIRED_COLUMNS)] != ROSTER_REQUIRED_COLUMNS:
                 raise RosterFileError(
-                    f"students.csv header = {header}, want {ROSTER_HEADER} "
-                    f"(hand-edited?). Use `gh teacher roster add/import` to manage the file."
+                    f"students.csv header = {header}, want it to start with "
+                    f"{ROSTER_REQUIRED_COLUMNS} (hand-edited?). Use "
+                    f"`gh teacher roster add/import` to manage the file."
                 )
+            # Reject the same malformed extra headers the Go reader rejects so
+            # both binaries agree the shared file is well-formed: a reused
+            # required name, a duplicate (csv.DictReader would silently last-wins
+            # it), or a formula-trigger name (CSV-injection on a CLI rewrite).
+            # Otherwise a hand-edit could be "broken" to the CLI yet silently
+            # graded here.
+            extra_columns = header[len(ROSTER_REQUIRED_COLUMNS) :]
+            seen_extra: set[str] = set()
+            for name in extra_columns:
+                if name in ROSTER_REQUIRED_COLUMNS:
+                    raise RosterFileError(
+                        f"students.csv extra column {name!r} reuses a reserved "
+                        f"column name (hand-edited?)."
+                    )
+                if name in seen_extra:
+                    raise RosterFileError(
+                        f"students.csv has a duplicate column {name!r} "
+                        f"(hand-edited?)."
+                    )
+                if name[:1] in _CSV_FORMULA_TRIGGERS:
+                    raise RosterFileError(
+                        f"students.csv extra column {name!r} begins with a "
+                        f"spreadsheet formula trigger (hand-edited?)."
+                    )
+                seen_extra.add(name)
             roster: list[dict[str, str]] = []
             for row in reader:
                 username = (row.get("username") or "").strip()
@@ -265,6 +383,19 @@ def read_students_csv(path: pathlib.Path) -> list[dict[str, str]]:
 # Per-classroom collection ----------------------------------------------------
 
 
+def valid_assignment_slugs(assignments: dict[str, Any]) -> list[str]:
+    """Slugs worth collecting: non-empty strings, in manifest order.
+    main()'s zero-submission guard counts these; the collect loop
+    applies the same slug predicate inline (it also needs each entry's
+    `due`), so the two agree on what counts as a collectable assignment."""
+    slugs: list[str] = []
+    for entry in assignments.get("assignments") or []:
+        slug = entry.get("slug")
+        if isinstance(slug, str) and slug:
+            slugs.append(slug)
+    return slugs
+
+
 def collect_classroom(
     *,
     api_url: str,
@@ -272,72 +403,225 @@ def collect_classroom(
     classroom_short: str,
     assignments: dict[str, Any],
     roster: list[dict[str, str]],
-    collect_token: str,
-) -> list[dict[str, Any]]:
-    """Return validated result payloads for every (student,
-    assignment) pair. Per-repo failures warn and skip; hard
+    service_token: str,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return (validated result payloads for every (student,
+    assignment) pair, count of assignments whose only submissions were
+    rejected by validation). Per-repo failures warn and skip; hard
     failures (auth: 401/403; network: synthetic 599) propagate and
-    main() converts them to exit 1.
+    main() converts them to exit 1. The second tuple element lets main()
+    distinguish a mode-flip-induced empty result (which has its own loud
+    warning) from a token-access problem.
     """
     results: list[dict[str, Any]] = []
+    group_attribution_degraded = 0
+    # Number of (assignment) buckets where every present submission was
+    # rejected by validation (the mode-flip symptom). Returned so main() can
+    # suppress its "rotate token" heuristic, which would otherwise misread a
+    # mode-flip-induced empty result as a token-access problem.
+    mode_flip_assignments = 0
+    # Roster usernames (lowercased) used to gate group attribution; depends
+    # only on the roster, so compute once outside the per-assignment loop.
+    roster_logins = {(s.get("username") or "").strip().lower() for s in roster}
+    roster_logins.discard("")
     for entry in assignments.get("assignments") or []:
         slug = entry.get("slug")
         if not isinstance(slug, str) or not slug:
             continue
 
+        due_raw = entry.get("due")
+        due = parse_rfc3339(due_raw) if due_raw else None
+        if due_raw and due is None:
+            emit_warning(
+                f"{classroom_short}/{slug}: due = {due_raw!r} is not an RFC 3339 "
+                f"timestamp with timezone; skipping late-marking for this assignment"
+            )
+
+        is_group = (entry.get("mode") or "").lower() == "group"
+        assignment_type = "group" if is_group else "individual"
+
         submitted = 0
+        # Repos under THIS assignment whose only submissions were rejected by
+        # validation (mode-flip symptom); reported once per assignment below.
+        mode_flip_repos: list[str] = []
         for student in roster:
             username = student["username"]
             repo_name = assignment_repo_name(classroom_short, slug, username)
 
             try:
-                release = latest_submit_release_or_none(api_url, org, repo_name, collect_token)
+                releases = all_submit_releases(api_url, org, repo_name, service_token)
             except urllib.error.HTTPError as exc:
                 if is_hard_http_error(exc):
                     raise
                 emit_warning(
-                    f"{org}/{repo_name}: latest release lookup failed: HTTP {exc.code} "
+                    f"{org}/{repo_name}: release listing failed: HTTP {exc.code} "
                     f"({exc.reason or 'no reason'}); skipping"
                 )
                 continue
             except (json.JSONDecodeError, ValueError) as exc:
-                emit_warning(f"{org}/{repo_name}: latest release response malformed ({exc}); skipping")
+                emit_warning(f"{org}/{repo_name}: release listing malformed ({exc}); skipping")
                 continue
-            if release is None:
+            if not releases:
                 # Student hasn't submitted/accepted/finished
                 # grading. Individual misses are quiet; the
                 # per-assignment summary reports the gap.
                 continue
 
-            try:
-                payload = download_result_asset(api_url, release, collect_token)
-            except urllib.error.HTTPError as exc:
-                if is_hard_http_error(exc):
-                    raise
-                emit_warning(
-                    f"{org}/{repo_name}: result.json download failed: HTTP {exc.code} "
-                    f"({exc.reason or 'no reason'}); skipping"
+            # Collect EVERY submission, newest first. Each release's
+            # result.json is downloaded and validated independently; a
+            # single bad/missing one warns and is skipped without dropping
+            # the others. `validation_rejected` counts releases that were
+            # present and downloaded but FAILED validate_result (the
+            # mode-flip / identity-mismatch symptom) — kept distinct from a
+            # benign download error or a missing asset, so the loud
+            # "mode flipped" warning below only fires on the real symptom.
+            history: list[dict[str, Any]] = []
+            validation_rejected = 0
+            for release in releases:
+                try:
+                    candidate = download_result_asset(api_url, release, service_token)
+                except urllib.error.HTTPError as exc:
+                    if is_hard_http_error(exc):
+                        raise
+                    emit_warning(
+                        f"{org}/{repo_name}: result.json download failed for "
+                        f"{release.get('tag_name')!r}: HTTP {exc.code} "
+                        f"({exc.reason or 'no reason'}); skipping that submission"
+                    )
+                    continue
+                except AssetMissingError as exc:
+                    emit_warning(
+                        f"{org}/{repo_name}: {release.get('tag_name')!r}: {exc}; "
+                        f"skipping that submission"
+                    )
+                    continue
+                except (json.JSONDecodeError, ValueError) as exc:
+                    emit_warning(
+                        f"{org}/{repo_name}: result.json malformed for "
+                        f"{release.get('tag_name')!r} ({exc}); skipping that submission"
+                    )
+                    continue
+
+                # validate_result enforces identity (owner == repo owner) AND
+                # that `assignment_type` matches the manifest mode (is_group),
+                # so a mode-flipped or mis-typed result is rejected here — no
+                # separate assignment_type cross-check is needed afterward.
+                try:
+                    validate_result(candidate, classroom_short, slug, username, is_group=is_group)
+                except ValueError as exc:
+                    emit_warning(
+                        f"{org}/{repo_name}: invalid result.json for "
+                        f"{release.get('tag_name')!r} ({exc}); skipping that submission"
+                    )
+                    validation_rejected += 1
+                    continue
+
+                # Lateness is advisory and marked per submission, on the
+                # submission record itself (each carries its own datetime).
+                if due is not None and not mark_late(candidate, due):
+                    emit_warning(
+                        f"{org}/{repo_name}: result.json datetime = "
+                        f"{candidate.get('datetime')!r} is not an RFC 3339 timestamp; "
+                        f"cannot mark lateness"
+                    )
+                # The stored submission record is the validated result payload
+                # minus the bucket-key `assignment` (it lives on the assignment
+                # bucket, not the record). Each record keeps result/v1 shape:
+                # owner + assignment_type + submitted_by, no usernames.
+                history.append({k: v for k, v in candidate.items() if k != "assignment"})
+
+            if not history:
+                # The repo had submit-tag releases but produced no creditable
+                # history. When releases were rejected specifically by
+                # validation (not merely a missing asset / transient download
+                # error), that is the symptom of an assignment whose `mode` was
+                # switched individual<->group mid-term: every prior release's
+                # assignment_type now mismatches and is rejected, silently
+                # reverting graded students to "not submitted". Count it for a
+                # single consolidated, loud assignment-level warning below
+                # (rather than one per repo), and so main() can distinguish
+                # this from a token-access problem. A benign asset-missing or
+                # transient-download repo does NOT count here.
+                if validation_rejected:
+                    mode_flip_repos.append(repo_name)
+                continue
+
+            # Group attribution: the runner emits owner-only (it can't read
+            # collaborators). Collection is authoritative — list the repo's
+            # collaborators intersected with the roster and credit them all via
+            # the entry's `member_usernames`. On a read failure, force it to the
+            # owner only (never trust student-supplied data) and warn, so a
+            # scope/transient issue degrades to owner-only. Individual entries
+            # carry no member list — `owner` is the sole credited student.
+            # Resolved BEFORE building the entry so `member_usernames` can sit
+            # right after `owner` in the written JSON key order.
+            members: list[str] | None = None
+            if is_group:
+                members, degraded_warning = attribute_group_members(
+                    api_url, org, repo_name, username, service_token, roster_logins
                 )
-                continue
-            except AssetMissingError as exc:
-                emit_warning(f"{org}/{repo_name}: {exc}; skipping")
-                continue
-            except (json.JSONDecodeError, ValueError) as exc:
-                emit_warning(f"{org}/{repo_name}: result.json malformed ({exc}); skipping")
-                continue
+                if degraded_warning is not None:
+                    group_attribution_degraded += 1
+                    emit_warning(degraded_warning)
+                elif len(members) == 1:
+                    # Read succeeded but credited only the owner — no other
+                    # rostered collaborator was found. Often expected (a solo
+                    # group submission), but it's also the symptom of a real
+                    # misconfiguration (teammates added but not on the roster,
+                    # or not added as collaborators at all), which would
+                    # otherwise be silent. Surface it so the teacher can check.
+                    emit_warning(
+                        f"{org}/{repo_name}: group submission credited to the owner "
+                        f"{username!r} only — no other roster member is a collaborator "
+                        f"on the repo. If this is a team submission, ensure each teammate "
+                        f"is on {classroom_short}/students.csv AND a collaborator on the "
+                        f"repo (added via `gh student invite`)."
+                    )
 
-            try:
-                validate_result(payload, classroom_short, slug, username)
-            except ValueError as exc:
-                emit_warning(f"{org}/{repo_name}: invalid result.json ({exc}); skipping")
-                continue
+            # Build the gradebook entry: identity/keying at the top, the full
+            # per-submission detail (score, datetime, tests, ...) ONLY inside
+            # `submissions` (newest first). `owner` is the stable per-bucket
+            # key (the repo owner from the <classroom>-<assignment>-<username>
+            # formula); it is invariant across re-collects even when a group's
+            # credited member set changes, so apply_updates replaces the entry
+            # in place. For a group entry `member_usernames` sits right
+            # after `owner`. `_assignment` / `_type` are transport-only hints
+            # for apply_updates (the bucket slug + type) and are stripped on store.
+            entry_row: dict[str, Any] = {
+                "_assignment": slug,
+                "_type": assignment_type,
+                "owner": username,
+            }
+            if members is not None:
+                entry_row["member_usernames"] = list(members)
+            entry_row["submissions"] = history
 
-            results.append(payload)
+            results.append(entry_row)
             submitted += 1
 
         print(f"{classroom_short}/{slug}: {submitted}/{len(roster)} submitted")
 
-    return results
+        if mode_flip_repos:
+            mode_flip_assignments += 1
+            emit_warning(
+                f"{classroom_short}/{slug}: {len(mode_flip_repos)} repo(s) had submit-tag "
+                f"release(s) but NONE were creditable — every present submission was rejected "
+                f"by validation. This is the symptom of switching this assignment's mode "
+                f"(individual<->group): prior submissions' assignment_type no longer matches "
+                f"{assignment_type!r}, so affected students show as not-submitted until they "
+                f"re-submit under the new mode. Affected repos: "
+                f"{', '.join(sorted(mode_flip_repos))}."
+            )
+
+    if group_attribution_degraded:
+        emit_warning(
+            f"{classroom_short}: {group_attribution_degraded} group submission(s) "
+            f"credited to the repo owner only because the collaborator read failed "
+            f"(teammates not credited). This usually means CLASSROOM50_SERVICE_TOKEN "
+            f"lacks the collaborator-read permission — rotate it with `gh teacher rotate-service-token`."
+        )
+
+    return results, mode_flip_assignments
 
 
 def assignment_repo_name(classroom: str, assignment: str, username: str) -> str:
@@ -345,6 +629,44 @@ def assignment_repo_name(classroom: str, assignment: str, username: str) -> str:
     `assignmentRepoName` in cli/gh-student/accept.go; changing the
     shape here without updating Go silently breaks the collect loop."""
     return f"{classroom.lower()}-{assignment.lower()}-{username.lower()}"
+
+
+# Due-date / lateness ---------------------------------------------------------
+
+
+def parse_rfc3339(value: Any) -> datetime.datetime | None:
+    """Parse an RFC 3339 timestamp into an aware datetime, or None
+    when it isn't one (non-string, unparseable, or missing a
+    timezone offset). Naive timestamps are rejected rather than
+    guessed at — lateness is a cross-timezone comparison, so an
+    ambiguous wall-clock time must not silently pick one.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    if not RFC3339_RE.fullmatch(value):
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
+def mark_late(payload: dict[str, Any], due: datetime.datetime) -> bool:
+    """Set payload["late"] by comparing the runner's submission
+    `datetime` (validated as a non-empty string, but not as a
+    timestamp) against the assignment's due date. Submitting exactly
+    at the deadline is on time. Returns False — leaving the payload
+    unmarked — when the timestamp doesn't parse; lateness is
+    advisory and must never drop a submission.
+    """
+    submitted = parse_rfc3339(payload.get("datetime"))
+    if submitted is None:
+        return False
+    payload["late"] = submitted > due
+    return True
 
 
 # scores.json read / write ----------------------------------------------------
@@ -375,19 +697,19 @@ def load_scores(path: pathlib.Path) -> dict[str, Any]:
     Malformed raises so the workflow fails instead of overwriting
     the teacher's work.
 
-    `submissions` is an object keyed by assignment slug. The legacy
-    shapes a v1 file can carry (a flat array, a stray `"{}"` string,
-    null) are coerced by `normalize_submissions` so an upgrade or a
-    hand-edit doesn't crash the run.
+    `assignments` must be the canonical object keyed by assignment slug,
+    each value an object `{ "type": ..., "entries": [...] }`. Legacy shapes
+    are not migrated (see normalize_assignments) — a non-canonical file
+    hard-fails.
     """
     if not path.is_file():
-        return {"schema": SCORES_SCHEMA_V1, "submissions": {}}
+        return {"schema": SCORES_SCHEMA_V1, "assignments": {}}
     try:
         raw = path.read_text()
     except OSError as exc:
         raise ScoresFileError(f"{path}: read failed: {exc}") from exc
     if not raw.strip():
-        return {"schema": SCORES_SCHEMA_V1, "submissions": {}}
+        return {"schema": SCORES_SCHEMA_V1, "assignments": {}}
     try:
         scores = strict_json_loads(raw)
     except (json.JSONDecodeError, ValueError) as exc:
@@ -399,76 +721,56 @@ def load_scores(path: pathlib.Path) -> dict[str, Any]:
             f"{path}: schema = {scores.get('schema')!r}, want {SCORES_SCHEMA_V1!r}"
         )
     try:
-        scores["submissions"] = normalize_submissions(scores.get("submissions"))
+        scores["assignments"] = normalize_assignments(scores.get("assignments"))
     except ValueError as exc:
         raise ScoresFileError(f"{path}: {exc}") from exc
+    # Drop the legacy root field if a hand-edit left it around — `assignments`
+    # is authoritative.
+    scores.pop("submissions", None)
     return scores
 
 
-def normalize_submissions(submissions: Any) -> dict[str, list[Any]]:
-    """Coerce the `submissions` field into the canonical
-    assignment-keyed map. Tolerates the shapes a v1 file can carry so
-    an upgrade or a hand-edit doesn't crash the collector:
+def normalize_assignments(assignments: Any) -> dict[str, dict[str, Any]]:
+    """Validate the `assignments` field as the canonical slug-keyed map.
+    Accepted shapes:
 
-      - None / missing              -> {}
-      - dict                        -> kept (each value forced to a list)
-      - "" / "{}" (string quirk)    -> re-parsed, then re-normalized
-      - [ ... ] (legacy flat array) -> regrouped by each row's
-                                       `assignment` (dropping that key)
+      - None / missing  -> {}
+      - object (dict)   -> each value must be an object
+                           `{ "type": <"individual"|"group">, "entries": [...] }`
 
-    Raises ValueError on anything else (a number, or a legacy-array
-    row we can't bucket) so genuine corruption fails the run instead
-    of being silently dropped on the next write.
+    Anything else hard-fails. Legacy shapes (a flat array, a stray "{}"
+    string wrapper, the old `submissions`-keyed map of bare entry lists) are
+    NOT migrated — backward compatibility is intentionally dropped, so a
+    non-canonical file fails the run loudly rather than being silently coerced.
     """
-    if submissions is None:
+    if assignments is None:
         return {}
-    if isinstance(submissions, str):
-        text = submissions.strip()
-        if not text:
-            return {}
-        try:
-            parsed = strict_json_loads(text)
-        except (json.JSONDecodeError, ValueError) as exc:
-            raise ValueError(f"submissions string is not valid JSON ({exc})")
-        return normalize_submissions(parsed)
-    if isinstance(submissions, list):
-        # Legacy flat array -> regroup by assignment, dropping the
-        # now-redundant key from each row. Fail fast on any row we
-        # can't bucket (non-dict, or no usable `assignment`) rather
-        # than silently dropping it on the next write -- the file may
-        # be a teacher's hand-edit and the run must not lose data.
-        grouped: dict[str, list[Any]] = {}
-        for i, row in enumerate(submissions):
-            if not isinstance(row, dict):
-                raise ValueError(
-                    f"legacy submissions[{i}] is not an object "
-                    f"(got {type(row).__name__}); fix it before re-running collect"
-                )
-            assignment = row.get("assignment")
-            if not isinstance(assignment, str) or not assignment:
-                raise ValueError(
-                    f"legacy submissions[{i}] is missing a non-empty string "
-                    f"'assignment' (got {assignment!r}); fix it before re-running collect"
-                )
-            grouped.setdefault(assignment, []).append(
-                {k: v for k, v in row.items() if k != "assignment"}
+    if not isinstance(assignments, dict):
+        raise ValueError(
+            f"assignments field must be an object keyed by assignment slug, "
+            f"got {type(assignments).__name__}"
+        )
+    normalized: dict[str, dict[str, Any]] = {}
+    for slug, bucket in assignments.items():
+        if not isinstance(bucket, dict):
+            raise ValueError(
+                f"assignments[{slug!r}] must be an object {{type, entries}}, "
+                f"got {type(bucket).__name__}"
             )
-        return grouped
-    if isinstance(submissions, dict):
-        normalized: dict[str, list[Any]] = {}
-        for assignment, rows in submissions.items():
-            if rows is None:
-                normalized[assignment] = []
-            elif isinstance(rows, list):
-                normalized[assignment] = rows
-            else:
-                raise ValueError(
-                    f"submissions[{assignment!r}] must be a list, got {type(rows).__name__}"
-                )
-        return normalized
-    raise ValueError(
-        f"submissions field must be an object, got {type(submissions).__name__}"
-    )
+        atype = bucket.get("type")
+        if atype not in ("individual", "group"):
+            raise ValueError(
+                f"assignments[{slug!r}].type must be 'individual' or 'group', got {atype!r}"
+            )
+        entries = bucket.get("entries")
+        if entries is None:
+            entries = []
+        elif not isinstance(entries, list):
+            raise ValueError(
+                f"assignments[{slug!r}].entries must be a list, got {type(entries).__name__}"
+            )
+        normalized[slug] = {"type": atype, "entries": entries}
+    return normalized
 
 
 def save_scores(path: pathlib.Path, scores: dict[str, Any]) -> None:
@@ -500,83 +802,115 @@ def save_scores(path: pathlib.Path, scores: dict[str, Any]) -> None:
 
 
 def apply_updates(scores: dict[str, Any], updates: Iterable[dict[str, Any]]) -> int:
-    """Merge incoming result payloads into the assignment-keyed
-    `scores["submissions"]` map; return the number of rows added or
-    replaced. Each stored row is the result payload with the
-    redundant `assignment` field dropped (it's the bucket key).
+    """Merge incoming gradebook entries into the slug-keyed
+    `scores["assignments"]` map; return the number of entries added or
+    replaced. Each incoming entry carries transport hints `_assignment`
+    (the bucket slug) and `_type` (the assignment mode), plus the canonical
+    entry fields (`owner`, optional `member_usernames`, `submissions[]`).
+    The hints are stripped before storage (entry_from_result).
 
-    Existing rows with `"override": true` are preserved verbatim.
-    Rows within a bucket are keyed by tuple(lowercased usernames) --
-    individual mode has exactly one username today; the tuple shape
-    leaves room for group submissions later.
+    Each assignment bucket is `{ "type": ..., "entries": [...] }`. Existing
+    entries with `"override": true` are preserved verbatim. Entries within a
+    bucket are keyed by the repo OWNER (`row_key`), which is invariant for a
+    repo — so a group entry whose credited member set changes between collects
+    (e.g. a degraded collaborator read drops it to owner-only) REPLACES its
+    prior entry instead of orphaning it and appending a duplicate.
+    Entries without an `owner` are not keyable and are skipped — legacy
+    migration is intentionally not performed.
     """
-    submissions: dict[str, Any] = scores["submissions"]
-    # Per-bucket index: assignment slug -> {usernames_key: row index}.
-    index: dict[str, dict[tuple[str, ...], int]] = {}
-    for assignment, rows in submissions.items():
-        bucket_index: dict[tuple[str, ...], int] = {}
-        for i, row in enumerate(rows):
-            if not isinstance(row, dict):
+    assignments: dict[str, Any] = scores["assignments"]
+    # Per-bucket index: assignment slug -> {row_key: entry index}.
+    index: dict[str, dict[str, int]] = {}
+    for slug, bucket in assignments.items():
+        bucket_index: dict[str, int] = {}
+        for i, ent in enumerate(bucket.get("entries", [])):
+            if not isinstance(ent, dict):
                 continue
-            key = usernames_key(row)
+            key = row_key(ent)
             if key is not None:
                 bucket_index[key] = i
-        index[assignment] = bucket_index
+        index[slug] = bucket_index
 
     changes = 0
     for update in updates:
-        assignment = update.get("assignment")
-        key = usernames_key(update)
-        if not isinstance(assignment, str) or not assignment or key is None:
+        slug = update.get("_assignment")
+        atype = update.get("_type")
+        key = row_key(update)
+        # Require a valid slug, a valid bucket type, and a keyable owner.
+        # Validating `atype` here (not just in the re-guard below) means a
+        # missing/garbage `_type` can never be persisted as a new bucket's
+        # `type` via setdefault. Collection always supplies a valid type;
+        # this is defensive against a hand-constructed update.
+        if (
+            not isinstance(slug, str) or not slug
+            or atype not in ("individual", "group")
+            or key is None
+        ):
             continue
-        row = entry_from_result(update)
-        bucket = submissions.setdefault(assignment, [])
-        bucket_index = index.setdefault(assignment, {})
+        entry = entry_from_result(update)
+        bucket = assignments.setdefault(slug, {"type": atype, "entries": []})
+        # Keep the bucket type in sync with the manifest-derived type.
+        bucket["type"] = atype
+        bucket.setdefault("entries", [])
+        entries = bucket["entries"]
+        bucket_index = index.setdefault(slug, {})
         idx = bucket_index.get(key)
         if idx is None:
-            bucket.append(row)
-            bucket_index[key] = len(bucket) - 1
+            entries.append(entry)
+            bucket_index[key] = len(entries) - 1
             changes += 1
             continue
 
-        existing = bucket[idx]
+        existing = entries[idx]
         if existing.get("override") is True:
             continue
-        if same_submission(existing, row):
+        if same_submission(existing, entry):
             continue
         # Preserve an explicit "override": false on replacement —
         # the teacher's "I reviewed this, keep refreshing" signal.
-        if "override" in existing and "override" not in row:
-            row = dict(row)
-            row["override"] = existing["override"]
-        bucket[idx] = row
+        if "override" in existing and "override" not in entry:
+            entry = dict(entry)
+            entry["override"] = existing["override"]
+        entries[idx] = entry
         changes += 1
     return changes
 
 
 def entry_from_result(payload: dict[str, Any]) -> dict[str, Any]:
-    """The stored gradebook row: the validated result payload minus
-    `assignment` (the bucket key -- keeping it would duplicate data).
-    Every other field, including `schema` and `tests`, is retained
-    verbatim; an existing `override` flag is carried through.
+    """The stored gradebook entry, minus the transport-only hints.
+
+    An entry is the shape collection builds: identity/keying fields at the
+    top level (`owner`, optional `member_usernames` for group) and the full
+    per-submission detail inside the `submissions` list (newest first). The
+    `_assignment` (bucket slug) and `_type` (mode) hints drive bucket
+    placement in apply_updates and are dropped here so they don't persist.
     """
-    return {k: v for k, v in payload.items() if k != "assignment"}
+    return {k: v for k, v in payload.items() if k not in ("_assignment", "_type")}
 
 
-def usernames_key(record: dict[str, Any]) -> tuple[str, ...] | None:
-    """tuple(lowercased usernames), or None for an unkeyable record
-    (missing/empty usernames or any non-string username). Rows within
-    an assignment bucket are matched on this.
+def row_key(record: dict[str, Any]) -> str | None:
+    """The stable per-bucket key: the repo OWNER login, lowercased.
+
+    Requires the explicit `owner` field (set by collection from the
+    repo-name formula). Returns None when `owner` is missing or not a
+    non-empty string — such a record is not keyable and `apply_updates`
+    skips it. There is no sole-username fallback and no legacy migration:
+    every canonical row carries `owner`.
+
+    Keying on the owner — not the credited `usernames` set — is what
+    makes a group re-collect replace its row instead of duplicating it
+    when the member set changes.
+
+    Cross-binary tie: the owner is the `<username>` component of the
+    `<classroom>-<assignment>-<username>` repo-name formula (see
+    `assignment_repo_name` here and `assignmentRepoName` in
+    cli/gh-student/accept.go); it is persisted as the row `owner` field,
+    which download.go reads tolerantly (rows decode as map[string]any).
     """
-    usernames = record.get("usernames") or []
-    if not isinstance(usernames, list) or not usernames:
-        return None
-    lowered: list[str] = []
-    for u in usernames:
-        if not isinstance(u, str) or not u:
-            return None
-        lowered.append(u.lower())
-    return tuple(lowered)
+    owner = record.get("owner")
+    if isinstance(owner, str) and owner:
+        return owner.lower()
+    return None
 
 
 def same_submission(a: dict[str, Any], b: dict[str, Any]) -> bool:
@@ -593,12 +927,24 @@ _REQUIRED_STR_FIELDS = ("submission", "commit", "release", "review", "datetime")
 
 
 def validate_result(
-    payload: Any, expected_classroom: str, expected_assignment: str, expected_username: str
+    payload: Any,
+    expected_classroom: str,
+    expected_assignment: str,
+    expected_username: str,
+    *,
+    is_group: bool = False,
 ) -> None:
     """Raise ValueError if the payload fails the v1 contract. The
-    classroom/assignment/username checks defend against a hostile
+    classroom/assignment/owner checks defend against a hostile
     result.json trying to land in someone else's scores.json — the
     triple must match the source repo's expected identity.
+
+    `owner` (the repo owner, the identity anchor) must equal
+    `expected_username` (the roster/repo-name-derived owner).
+    `assignment_type` must be "individual"/"group" and match the mode
+    implied by `is_group`. There is no `usernames` field: who pushed is
+    `submitted_by`; the credited member list (group) is resolved by
+    collection after this check.
     """
     if not isinstance(payload, dict):
         raise ValueError(f"top-level value must be an object, got {type(payload).__name__}")
@@ -613,15 +959,19 @@ def validate_result(
     if assignment != expected_assignment:
         raise ValueError(f"assignment = {assignment!r}, want {expected_assignment!r}")
 
-    usernames = payload.get("usernames")
-    if not isinstance(usernames, list) or len(usernames) != 1 or not isinstance(usernames[0], str):
+    owner = payload.get("owner")
+    if not isinstance(owner, str) or not owner:
+        raise ValueError(f"owner must be a non-empty string, got {owner!r}")
+    if owner.lower() != expected_username.lower():
         raise ValueError(
-            f"usernames must be a one-element list of strings (v0.2 individual mode), "
-            f"got {usernames!r}"
+            f"owner = {owner!r}, want {expected_username!r} (derived from the repo name)"
         )
-    if usernames[0].lower() != expected_username.lower():
+
+    expected_type = "group" if is_group else "individual"
+    assignment_type = payload.get("assignment_type")
+    if assignment_type != expected_type:
         raise ValueError(
-            f"usernames[0] = {usernames[0]!r}, want {expected_username!r} (derived from roster)"
+            f"assignment_type = {assignment_type!r}, want {expected_type!r}"
         )
 
     submission = payload.get("submission")
@@ -661,6 +1011,20 @@ def validate_result(
                 f"tests[{i}].score ({test['score']}) > tests[{i}].max-score ({test['max-score']})"
             )
 
+    # submitted_by is optional (older results omit it). When present it
+    # records who pushed the submission; validate its shape so a
+    # hand-edited result.json can't store a malformed identity.
+    submitted_by = payload.get("submitted_by")
+    if submitted_by is not None:
+        if not isinstance(submitted_by, dict):
+            raise ValueError(f"submitted_by must be an object, got {type(submitted_by).__name__}")
+        uname = submitted_by.get("username")
+        if not isinstance(uname, str) or not uname:
+            raise ValueError("submitted_by.username must be a non-empty string")
+        sid = submitted_by.get("id")
+        if sid is not None and (isinstance(sid, bool) or not isinstance(sid, int)):
+            raise ValueError(f"submitted_by.id must be an integer or null, got {sid!r}")
+
 
 # GitHub API helpers ----------------------------------------------------------
 
@@ -691,68 +1055,244 @@ def _repo_url(api_url: str, owner: str, repo: str) -> str:
     )
 
 
-def latest_submit_release_or_none(
+def all_submit_releases(
     api_url: str, owner: str, repo: str, token: str
-) -> dict[str, Any] | None:
-    """Return the newest submit-tag release for a repo, or None.
-    Fast path: one call to `/releases/latest`. When latest is a
-    non-submit release, scan a bounded recent-releases window so a
-    student's hand-created release doesn't hide their submission.
-    """
-    latest = latest_release_or_none(api_url, owner, repo, token)
-    if latest is None:
-        return None
-    tag = latest.get("tag_name") or ""
-    if tag.startswith(SUBMIT_TAG_PREFIX):
-        return latest
-
-    for release in list_recent_releases(api_url, owner, repo, token, limit=MAX_RELEASES_FALLBACK):
-        tag = release.get("tag_name") or ""
-        if tag.startswith(SUBMIT_TAG_PREFIX):
-            return release
-    return None
-
-
-def latest_release_or_none(
-    api_url: str, owner: str, repo: str, token: str
-) -> dict[str, Any] | None:
-    """GET /repos/{owner}/{repo}/releases/latest. 404 → None
-    (covers both "no releases yet" and "repo not accepted yet"; the
-    nightly run shouldn't fail because one student isn't
-    participating). Other HTTP errors propagate so the workflow
-    fails loudly.
-    """
-    url = f"{_repo_url(api_url, owner, repo)}/releases/latest"
-    try:
-        body = _http_get(url, token, accept="application/vnd.github+json")
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return None
-        raise
-    release = json.loads(body.decode("utf-8"))
-    if not isinstance(release, dict):
-        raise ValueError(f"GET {url}: expected JSON object, got {type(release).__name__}")
-    return release
-
-
-def list_recent_releases(
-    api_url: str, owner: str, repo: str, token: str, *, limit: int
 ) -> list[dict[str, Any]]:
-    """Up to `limit` most recent releases (newest first). Used as a
-    bounded fallback when `/releases/latest` is a non-submit tag.
+    """Return EVERY submit-tag release for a repo, newest first, walking
+    the full /releases pagination.
+
+    This collects the complete submission history: a student who pushed N
+    times to `main` has N submit/* releases, and all N are returned.
+    Non-submit releases (e.g. a student's hand-created tag) are filtered
+    out. A 404 (no releases yet, or repo not accepted) yields an empty
+    list.
+
+    Pagination follows GitHub's authoritative `Link: rel="next"` header
+    (host-pinned to api_url so the bearer token can't be pivoted off-host),
+    falling back to the short-page heuristic when no Link header is present
+    — mirrors list_repo_collaborator_logins.
     """
-    per_page = max(1, min(limit, 100))
-    url = f"{_repo_url(api_url, owner, repo)}/releases?per_page={per_page}"
-    body = _http_get(url, token, accept="application/vnd.github+json")
-    releases = json.loads(body.decode("utf-8"))
-    if not isinstance(releases, list):
-        raise ValueError(f"GET {url}: expected JSON array, got {type(releases).__name__}")
-    for i, release in enumerate(releases):
-        if not isinstance(release, dict):
-            raise ValueError(
-                f"GET {url}: expected release object at index {i}, got {type(release).__name__}"
+    per_page = 100
+    max_pages = 100
+    releases: list[dict[str, Any]] = []
+    url = f"{_repo_url(api_url, owner, repo)}/releases?per_page={per_page}&page=1"
+    seen_next: set[str] = set()
+    for page in range(1, max_pages + 1):
+        try:
+            body, headers = _http_get_with_headers(
+                url, token, accept="application/vnd.github+json"
             )
-    return releases
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return []
+            raise
+        batch = json.loads(body.decode("utf-8"))
+        if not isinstance(batch, list):
+            raise ValueError(f"GET {url}: expected JSON array, got {type(batch).__name__}")
+        for i, release in enumerate(batch):
+            if not isinstance(release, dict):
+                raise ValueError(
+                    f"GET {url}: expected release object at index {i}, got {type(release).__name__}"
+                )
+            if (release.get("tag_name") or "").startswith(SUBMIT_TAG_PREFIX):
+                releases.append(release)
+        link_header = headers.get("Link") if headers else None
+        next_url = _next_page_link(link_header)
+        if next_url:
+            next_url = _assert_same_host(next_url, api_url)
+            if next_url in seen_next:
+                return releases
+            seen_next.add(next_url)
+            url = next_url
+            continue
+        if link_header or len(batch) < per_page:
+            return releases
+        url = f"{_repo_url(api_url, owner, repo)}/releases?per_page={per_page}&page={page + 1}"
+    raise ValueError(
+        f"repos/{owner}/{repo}/releases: too many releases to enumerate "
+        f"(hit the {max_pages}-page cap)"
+    )
+
+
+def _next_page_link(link_header: str | None) -> str | None:
+    """The `rel="next"` URL from a GitHub `Link` response header, or
+    None when there is no next page (or no header). GitHub's pagination
+    guidance is to follow this URL rather than to synthesize page numbers,
+    since page size and the presence of a next page are the server's to
+    decide. Mirrors NextPageLink in cli/shared/ghutil/ghutil.go.
+    """
+    if not link_header:
+        return None
+    m = re.search(r'<([^>]+)>\s*;\s*[^,]*rel="next"', link_header)
+    return m.group(1) if m else None
+
+
+def _assert_same_host(next_url: str, api_url: str) -> str:
+    """Return next_url only if its scheme+host match api_url's; otherwise
+    raise ValueError. The pagination loop attaches `Authorization: Bearer
+    <service token>` to whatever URL it follows, so a malicious or MITM'd
+    API response whose `Link: rel="next"` points at another host would
+    otherwise pivot the token off-host. The redirect path already defends
+    this via _AuthStrippingRedirect; this is the equivalent fail-closed
+    guard on the Link-follow path. A legitimate api.github.com / GHES next
+    page stays on the same host and passes unchanged.
+    """
+    api = urllib.parse.urlsplit(api_url)
+    nxt = urllib.parse.urlsplit(next_url)
+    if (nxt.scheme, nxt.netloc) != (api.scheme, api.netloc):
+        raise ValueError(
+            f"pagination Link points off-host "
+            f"({nxt.scheme}://{nxt.netloc} != {api.scheme}://{api.netloc}); "
+            f"refusing to send the service token to a different host"
+        )
+    return next_url
+
+
+def list_repo_collaborator_logins(
+    api_url: str, owner: str, repo: str, token: str
+) -> list[str]:
+    """Logins of every direct collaborator on owner/repo, walking
+    pagination.
+
+    This returns ALL collaborators regardless of permission level. The
+    crediting gate is NOT the permission level — it is roster membership,
+    applied by the caller (group_member_usernames intersects with the
+    classroom roster). Filtering on `role_name == "admin"` here was a bug:
+    a group teammate who is also an org owner (admin on every repo), or a
+    founder kept as repo `admin` so they can invite teammates,
+    is `admin` yet a legitimate student — the old filter silently dropped
+    them, crediting only the repo owner. Instructors/TAs/org-owners who are
+    not students are excluded downstream because they are not on the roster,
+    so dropping the admin filter here loses no protection.
+
+    Pagination follows GitHub's authoritative `Link: rel="next"` header
+    rather than guessing the next page from page length; the short-page
+    heuristic is only the fallback when no Link header is present. The
+    followed next URL is host-pinned to api_url so the bearer token can't
+    be pivoted to a foreign host by a crafted Link header.
+
+    Raises urllib.error.HTTPError on any non-2xx (including 404) so the
+    caller can decide between an owner-only fallback and a hard failure.
+    """
+    per_page = 100
+    max_pages = 100
+    logins: list[str] = []
+    url = (
+        f"{_repo_url(api_url, owner, repo)}/collaborators"
+        f"?per_page={per_page}&page=1"
+    )
+    seen_next: set[str] = set()
+    for page in range(1, max_pages + 1):
+        body, headers = _http_get_with_headers(
+            url, token, accept="application/vnd.github+json"
+        )
+        batch = json.loads(body.decode("utf-8"))
+        if not isinstance(batch, list):
+            raise ValueError(f"GET {url}: expected JSON array, got {type(batch).__name__}")
+        for c in batch:
+            if not isinstance(c, dict):
+                continue
+            login = c.get("login")
+            if isinstance(login, str) and login:
+                logins.append(login)
+        link_header = headers.get("Link") if headers else None
+        next_url = _next_page_link(link_header)
+        if next_url:
+            next_url = _assert_same_host(next_url, api_url)
+            # Stop if the server points us back at a page we've already
+            # fetched (self/looping rel="next"): bounds a crafted or buggy
+            # Link chain to the pages actually seen instead of running out
+            # the max_pages cap.
+            if next_url in seen_next:
+                return logins
+            seen_next.add(next_url)
+            url = next_url
+            continue
+        if link_header or len(batch) < per_page:
+            return logins
+        url = (
+            f"{_repo_url(api_url, owner, repo)}/collaborators"
+            f"?per_page={per_page}&page={page + 1}"
+        )
+    raise ValueError(
+        f"repos/{owner}/{repo}/collaborators: too many collaborators to "
+        f"enumerate (hit the {max_pages}-page cap)"
+    )
+
+
+def group_member_usernames(
+    api_url: str, org: str, repo: str, owner_username: str, token: str, roster_logins: set[str]
+) -> list[str]:
+    """Member list for a group submission: the repo's collaborators
+    (any permission level) **intersected with the roster**
+    (case-insensitive), sorted and deduped, with the owner guaranteed
+    present. Crediting is gated on roster membership, NOT on collaborator
+    permission: a rostered teammate is credited whether they hold push or
+    admin (an org owner is admin on every repo; a founder is kept admin so
+    they can invite). A non-rostered collaborator (instructor, TA, org
+    owner who is not a student, or an account added out-of-band via the
+    GitHub UI) is never credited. Raises on the underlying HTTP/parse error
+    so the caller can fall back to owner-only.
+
+    TRUST ASSUMPTION (F6, documented residual): every rostered collaborator
+    on the repo is credited the shared score. GitHub does not record *how* a
+    collaborator was added, so collection cannot distinguish a teammate the
+    founder added via `gh student invite` from one a student added directly
+    through the GitHub UI. The roster intersection
+    bounds the blast radius to rostered classmates — a stranger can never be
+    credited — but a student could still add a rostered classmate as a
+    collaborator and credit them this assignment's score. Treating that as
+    acceptable (rostered students are mutually trusted within a classroom) is
+    the deliberate, simple model; see wiki/Autograders.md. Tightening it would
+    require a teacher-approved group manifest, deferred as out of scope.
+    """
+    logins = list_repo_collaborator_logins(api_url, org, repo, token)
+    seen: dict[str, str] = {}
+    owner_key = owner_username.lower()
+    for login in [owner_username, *logins]:
+        key = login.lower()
+        # The owner is always credited; other collaborators only if
+        # they are on the roster for this classroom.
+        if key != owner_key and key not in roster_logins:
+            continue
+        if key not in seen:
+            # Store the OWNER under its own (repo-derived) casing, but
+            # normalize every other member to lowercase. GitHub's
+            # /collaborators can return a login under different casing
+            # between collects; storing that raw casing made the member
+            # list (and thus same_submission) churn and rewrite the entry
+            # every run. Lowercasing non-owner members is deterministic
+            # across collects (crediting is case-insensitive anyway), so an
+            # unchanged group submission compares equal and is left alone.
+            seen[key] = owner_username if key == owner_key else key
+    return [seen[k] for k in sorted(seen)]
+
+
+def attribute_group_members(
+    api_url: str, org: str, repo: str, owner_username: str, token: str, roster_logins: set[str]
+) -> tuple[list[str], str | None]:
+    """Resolve the member list to credit for a group submission.
+
+    Returns (usernames, warning). On success `usernames` is the rostered
+    collaborator list (owner always included) and `warning` is None. On a
+    collaborator-read failure `usernames` is forced to [owner] — never the
+    runner/student-supplied list — and `warning` is a non-None message the
+    caller should emit and count as a degraded attribution.
+    """
+    try:
+        return group_member_usernames(api_url, org, repo, owner_username, token, roster_logins), None
+    except urllib.error.HTTPError as exc:
+        return [owner_username], (
+            f"{org}/{repo}: could not read group collaborators "
+            f"(HTTP {exc.code} {exc.reason or 'no reason'}); crediting the "
+            f"repo owner {owner_username!r} only. Ensure CLASSROOM50_SERVICE_TOKEN "
+            f"can read repository collaborators (see the service-token wiki)."
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        return [owner_username], (
+            f"{org}/{repo}: group collaborator listing malformed "
+            f"({exc}); crediting the repo owner {owner_username!r} only."
+        )
 
 
 def download_result_asset(
@@ -825,10 +1365,26 @@ def rewrite_asset_url(asset_url: str, api_url: str) -> str:
 def _http_get(
     url: str, token: str, *, accept: str, max_bytes: int | None = None, _retries: int = 3
 ) -> bytes:
-    """GET `url` with bearer auth; return the body. Retries 5xx/429
-    with exponential backoff. The custom redirect handler strips
-    Authorization before following GitHub's asset-download redirect
-    to S3 (otherwise the signed URL rejects the forwarded token).
+    """GET `url` with bearer auth; return the body. Thin wrapper over
+    `_http_get_with_headers` for the callers that don't need the
+    response headers (release/asset reads)."""
+    body, _headers = _http_get_with_headers(
+        url, token, accept=accept, max_bytes=max_bytes, _retries=_retries
+    )
+    return body
+
+
+def _http_get_with_headers(
+    url: str, token: str, *, accept: str, max_bytes: int | None = None, _retries: int = 3
+) -> tuple[bytes, Any]:
+    """GET `url` with bearer auth; return (body, response headers).
+    Retries 5xx/429 with exponential backoff. The custom redirect
+    handler strips Authorization before following GitHub's asset-download
+    redirect to S3 (otherwise the signed URL rejects the forwarded token).
+
+    The headers are returned so paginated callers can follow GitHub's
+    authoritative `Link: rel="next"` rather than guessing the next page
+    from page length.
     """
     for attempt in range(_retries):
         req = urllib.request.Request(
@@ -843,7 +1399,8 @@ def _http_get(
         )
         try:
             with _OPENER.open(req, timeout=30) as resp:
-                return resp.read(max_bytes) if max_bytes is not None else resp.read()
+                body = resp.read(max_bytes) if max_bytes is not None else resp.read()
+                return body, resp.headers
         except urllib.error.HTTPError as exc:
             if exc.code in (429, 500, 502, 503, 504) and attempt < _retries - 1:
                 # Honor Retry-After (capped at 30s); else exp backoff.
@@ -852,18 +1409,26 @@ def _http_get(
                 time.sleep(delay)
                 continue
             raise
-        except urllib.error.URLError as exc:
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            # urllib wraps a connect-phase failure in URLError, but a
+            # timeout (or reset) during resp.read() raises socket.timeout
+            # (= TimeoutError, an OSError) which is NOT a URLError — so a
+            # stalled response body would otherwise escape this retry path
+            # and crash the run with a bare traceback past main()'s
+            # HTTPError handler. Catch all three so a read-phase stall
+            # retries and then wraps into the synthetic 599 that
+            # is_hard_http_error already classifies as a hard failure.
             if attempt < _retries - 1:
                 time.sleep(2 ** attempt)
                 continue
             raise urllib.error.HTTPError(
                 url=url,
                 code=599,
-                msg=f"network error: {exc.reason}",
+                msg=f"network error: {exc}",
                 hdrs=None,  # type: ignore[arg-type]
                 fp=None,
             ) from exc
-    raise RuntimeError(f"_http_get called with _retries={_retries}")
+    raise RuntimeError(f"_http_get_with_headers called with _retries={_retries}")
 
 
 def is_hard_http_error(exc: urllib.error.HTTPError) -> bool:
