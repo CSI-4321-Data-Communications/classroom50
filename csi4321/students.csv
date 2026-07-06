@@ -1,1 +1,2 @@
-username,first_name,last_name,email,section,github_id
+username,first_name,last_name,email,section,github_id,enrollment_status,enrollment_method,email_hash,invite_token,invited_at,enrolled_at
+AnaChen995,,,,,294057213,invited,github,,bd5f383398e2c28fa5b7c07c96704a5e,2026-07-06T04:09:29.711Z,
