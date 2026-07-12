@@ -1,1 +1,54 @@
+# csi4321/autograders/project0.yaml
+runtime: python@3.12
 
+run: python3 -c "$AUTOGRADER_SCRIPT"
+
+env:
+  AUTOGRADER_SCRIPT: |
+    import json
+    import subprocess
+    from pathlib import Path
+
+    def grade():
+        score = 0
+        max_score = 100
+        msg = "No output"
+        
+        result = subprocess.run(["cargo", "run", "--quiet"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        output = result.stdout.strip()
+        has_compile_error = result.returncode != 0
+        
+        if output == "Hello, world!":
+            if not has_compile_error:
+                score = 100
+                msg = "Perfect! Correct output and compiled cleanly."
+            else:
+                score = 50
+                msg = "Correct output, but contained syntax/compiler errors."
+        else:
+            main_rs = Path("src/main.rs")
+            if main_rs.exists() and 'Hello, world!' in main_rs.read_text():
+                score = 50
+                msg = "Correct code detected in source, but contained syntax/compiler errors."
+            else:
+                score = 0
+                msg = "Incorrect output or failed to run."
+                
+        result_json = {
+            "schema": "classroom50/result/v1",
+            "score": score,
+            "max-score": max_score,
+            "tests": [
+                {
+                    "test-name": "Hello World Check",
+                    "passed": score > 0,
+                    "score": score,
+                    "max-score": max_score,
+                    "feedback": msg
+                }
+            ]
+        }
+        print(json.dumps(result_json))
+
+    if __name__ == "__main__":
+        grade()
