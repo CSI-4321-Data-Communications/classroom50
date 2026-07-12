@@ -10,7 +10,7 @@
         "branch": "main"
       },
       "mode": "individual",
-      "autograder": "default"
+      "autograder": "project0"
     },
     {
       "slug": "project1",
