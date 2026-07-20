@@ -73,8 +73,9 @@ ASSIGNMENTS_SCHEMA_V1 = "classroom50/assignments/v1"
 # prefix aligned with autograde-runner.yaml and collect_scores.py.
 SUBMIT_TAG_PREFIX = "submit/"
 
-# Branch whose HEAD we re-tag. Submissions are graded off `main` (the autograde
-# shim's `on.push.branches`), so that's the ref we regrade.
+# Fallback submission branch when a repo's default branch can't be read.
+# Submissions grade off the repo's default branch (the autograde shim's
+# `on.push.branches`); `main` is only the fallback for a repo with no default.
 SUBMISSION_BRANCH = "main"
 
 # How often (every N repos) the fan-out logs incremental progress, so a run
@@ -130,6 +131,14 @@ def main() -> int:
     classroom_dir = base_dir / classroom_filter
     try:
         roster = load_roster(classroom_dir, assignment_filter, api_url, org, service_token)
+    except EmptyRepoAssignment:
+        # Successful no-op, not a failure: the teacher (or a stale button)
+        # targeted an assignment whose repos are deliberately bare.
+        print(
+            f"regrade {classroom_filter}/{assignment_filter}: assignment has "
+            f"empty_repo enabled — autograding is disabled, nothing to regrade."
+        )
+        return 0
     except RegradeInputError as exc:
         emit_error(str(exc))
         return 1
@@ -365,10 +374,35 @@ def build_submit_tag(sha: str) -> str:
     return f"{SUBMIT_TAG_PREFIX}{stamp}-{sha[:7]}"
 
 
+def repo_default_branch(api_url: str, org: str, repo: str, token: str) -> str | None:
+    """The repo's default branch (which GitHub may have named `master`), or None
+    when the repo doesn't exist (404) — the student hasn't accepted."""
+    try:
+        body = _http_get(
+            _repo_url(api_url, org, repo), token, accept="application/vnd.github+json"
+        )
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise
+    data = json.loads(body.decode("utf-8"))
+    branch = data.get("default_branch") if isinstance(data, dict) else None
+    if isinstance(branch, str) and branch:
+        return branch
+    return SUBMISSION_BRANCH
+
+
 def main_head_sha(api_url: str, org: str, repo: str, token: str) -> str | None:
-    """The commit SHA at `repo`'s main branch HEAD, or None when the repo
-    or branch doesn't exist (404) — the student hasn't accepted/pushed."""
-    url = f"{_repo_url(api_url, org, repo)}/git/ref/heads/{urllib.parse.quote(SUBMISSION_BRANCH)}"
+    """The commit SHA at `repo`'s default-branch HEAD, or None when the repo
+    or branch doesn't exist (404) — the student hasn't accepted/pushed.
+
+    Resolves the repo's actual default branch first (it may be `master`), so a
+    non-main repo is regraded off its real HEAD rather than a nonexistent
+    `main`."""
+    branch = repo_default_branch(api_url, org, repo, token)
+    if branch is None:
+        return None
+    url = f"{_repo_url(api_url, org, repo)}/git/ref/heads/{urllib.parse.quote(branch)}"
     try:
         body = _http_get(url, token, accept="application/vnd.github+json")
     except urllib.error.HTTPError as exc:
@@ -379,7 +413,7 @@ def main_head_sha(api_url: str, org: str, repo: str, token: str) -> str | None:
     obj = ref.get("object") if isinstance(ref, dict) else None
     sha = obj.get("sha") if isinstance(obj, dict) else None
     if not isinstance(sha, str) or not sha:
-        raise ValueError(f"git/ref/heads/{SUBMISSION_BRANCH} returned no object.sha")
+        raise ValueError(f"git/ref/heads/{branch} returned no object.sha")
     return sha
 
 
@@ -513,6 +547,22 @@ class RegradeInputError(Exception):
     """A missing/malformed classroom dir, classroom.json, or assignments.json."""
 
 
+class EmptyRepoAssignment(Exception):
+    """The target assignment has empty_repo: true — student repos carry no
+    autograde workflow, so there is nothing to re-run and no HEAD worth tagging
+    (the first-grade fallback would push submit/* tags that fire nothing).
+    main() treats this as a successful no-op, not an error."""
+
+
+def is_empty_repo(entry: dict[str, Any]) -> bool:
+    """True only when empty_repo is the boolean `true`. The wire contract is a
+    JSON boolean (Go decodes a strict `bool`; TS uses `=== true`), so a
+    non-boolean value from a hand-edited manifest is not empty_repo. Keep this
+    byte-identical to collect_scores.py / the autograde-runner so every tool
+    agrees on the predicate."""
+    return entry.get("empty_repo") is True
+
+
 def load_roster(
     classroom_dir: pathlib.Path,
     assignment_slug: str,
@@ -545,16 +595,21 @@ def load_roster(
             f"{classroom_dir.name}/assignments.json schema = "
             f"{assignments.get('schema')!r}, want {ASSIGNMENTS_SCHEMA_V1!r}"
         )
-    slugs = {
-        e.get("slug")
+    entries = {
+        e["slug"]: e
         for e in (assignments.get("assignments") or [])
         if isinstance(e, dict) and isinstance(e.get("slug"), str) and e.get("slug")
     }
-    if assignment_slug not in slugs:
+    if assignment_slug not in entries:
         raise RegradeInputError(
             f"assignment {assignment_slug!r} is not registered in "
             f"{classroom_dir.name}/assignments.json"
         )
+    # empty_repo assignments never autograde (accept commits no workflow), so
+    # skip before the team listing — otherwise the first-grade fallback would
+    # push useless submit/* tags into every student repo.
+    if is_empty_repo(entries[assignment_slug]):
+        raise EmptyRepoAssignment(assignment_slug)
 
     # Resolve the classroom team slug: classroom.json's authoritative team.slug
     # (GitHub may re-slug on a name collision), else the derived slug.
@@ -712,10 +767,9 @@ def _assert_same_host(next_url: str, api_url: str) -> str:
 
 
 def assignment_repo_name(classroom: str, assignment: str, username: str) -> str:
-    """Canonical student-repo name. Cross-binary contract — mirrors
-    `assignment_repo_name` in collect_scores.py and `assignmentRepoName` in
-    cli/gh-student/accept.go; changing the shape here without updating the
-    others silently breaks the regrade fan-out."""
+    """Canonical student-repo name. Mirrors the formula single-sourced in
+    cli/shared/contract (AssignmentRepoName); keep byte-identical or the
+    regrade fan-out misidentifies submissions."""
     return f"{classroom.lower()}-{assignment.lower()}-{username.lower()}"
 
 
