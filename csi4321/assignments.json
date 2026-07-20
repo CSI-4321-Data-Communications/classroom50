@@ -66,6 +66,13 @@
       },
       "mode": "individual",
       "autograder": "default"
+    },
+    {
+      "slug": "test",
+      "name": "Test",
+      "mode": "individual",
+      "autograder": "default",
+      "feedback_pr": true
     }
   ]
 }
