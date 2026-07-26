@@ -1,0 +1,26 @@
+{
+  "schema": "classroom50/classroom/v1",
+  "name": "CSI-4321-F26",
+  "short_name": "csi-4321-f26",
+  "term": "Fall 2026",
+  "org": "CSI-4321-Data-Communications",
+  "team": {
+    "id": 18695724,
+    "slug": "classroom50-csi-4321-f26"
+  },
+  "teams": {
+    "teacher": {
+      "id": 18695725,
+      "slug": "classroom50-csi-4321-f26-teacher"
+    },
+    "hta": {
+      "id": 18695726,
+      "slug": "classroom50-csi-4321-f26-hta"
+    },
+    "ta": {
+      "id": 18695727,
+      "slug": "classroom50-csi-4321-f26-ta"
+    }
+  },
+  "secret": "gxoep72p"
+}
