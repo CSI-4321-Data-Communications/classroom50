@@ -36,6 +36,8 @@ history is unavailable or baseline == commit).
 from __future__ import annotations
 
 import datetime
+import difflib
+import errno
 import importlib.util
 import io
 import json
@@ -44,6 +46,7 @@ import pathlib
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -63,6 +66,14 @@ RESULT_SCHEMA_V1 = "classroom50/result/v1"
 # (cli/shared/contract/contract.go); test_runner.py pins these literals.
 RESULT_FILENAME = "result.json"
 RELEASE_BODY_FILENAME = "release-body.md"
+RELEASE_ASSETS_DIRNAME = "classroom50-release-assets"
+RELEASE_ASSETS_MAX_FILES = 50
+RELEASE_ASSETS_MAX_PATH_BYTES = 8_192
+RELEASE_ASSETS_MAX_BYTES = 104_857_600
+RELEASE_ASSET_BASENAME = re.compile(
+    r"^[A-Za-z0-9_-](?:[A-Za-z0-9._-]{0,253}[A-Za-z0-9_-])?$",
+    re.ASCII,
+)
 
 # Name of both the per-assignment override and classroom-default entrypoint.
 ENTRYPOINT_FILENAME = "autograder.py"
@@ -80,6 +91,15 @@ DEFAULT_TEST_TIMEOUT = 10
 # Cap captured stdout/stderr in the release body so a runaway program can't
 # bloat the published release.
 MAX_CAPTURED_CHARS = 2000
+
+# ANSI codes for the log report -- the Actions log viewer renders these, the
+# release body (Markdown) must never see them, so color is applied only at
+# render time in render_log_report.
+ANSI_RED = "\x1b[31m"
+ANSI_GREEN = "\x1b[32m"
+ANSI_CYAN = "\x1b[36m"
+ANSI_BOLD = "\x1b[1m"
+ANSI_RESET = "\x1b[0m"
 
 # Test types and io comparison modes -- mirror the allow-lists in tests.go.
 TEST_TYPE_IO = "io"
@@ -118,7 +138,7 @@ ACCEPT_MARKER_PATH = ".classroom50.yaml"
 # Mirrors classroomcfg.DropFiles (cli/gh-student/internal/classroomcfg/
 # metadata.go), which commits exactly MetadataPath + AutogradeWorkflowPath --
 # keep in lockstep. is_acceptance_commit uses this to fail open when the tip
-# accept commit also adds non-setup files (e.g. amended/squashed real work),
+# accept commit also adds non-setup files (e.g., amended/squashed real work),
 # so that work is graded rather than silently skipped.
 ACCEPT_COMMIT_PATHS = frozenset(
     {
@@ -174,7 +194,7 @@ def username_from_repo(repository: str, classroom: str, assignment: str, actor: 
 
     Mirrors the naming formula single-sourced in cli/shared/contract
     (AssignmentRepoName); keep byte-identical. Falls back to GITHUB_ACTOR when
-    the repo name doesn't follow the convention (e.g. hand-created test repos).
+    the repo name doesn't follow the convention (e.g., hand-created test repos).
     """
     if "/" in repository:
         _, repo = repository.split("/", 1)
@@ -520,7 +540,7 @@ def _baseline_scan(workspace: pathlib.Path) -> tuple[str | None, str]:
         (ACCEPT_MARKER_PATH). A trusted baseline.
       - SOURCE_ROOT:      the repo's root commit (no commit added the marker)
         -- a best-effort baseline.
-      - SOURCE_GIT_ERROR: git ran but failed (e.g. "dubious ownership" in a
+      - SOURCE_GIT_ERROR: git ran but failed (e.g., "dubious ownership" in a
         container, or an un-deepenable shallow clone). History might exist; we
         couldn't read it. Distinct from SOURCE_NONE so the caller warns right.
       - SOURCE_NONE:      no history to resolve -- git unavailable or not a repo.
@@ -666,7 +686,7 @@ def feedback_base_outcome(
     A reviewable diff against the root commit beats no Feedback PR at all, and
     the untrusted-baseline warning tells the teacher to verify.
 
-    `scan` lets a caller that already ran `_baseline_scan` (e.g. main(), which
+    `scan` lets a caller that already ran `_baseline_scan` (e.g., main(), which
     also needs the review-link baseline) reuse it instead of re-walking history
     -- the scan issues several sequential git calls, so a second walk doubles
     the worst-case time against the job ceiling.
@@ -696,6 +716,278 @@ def parse_allowed_files(raw: str | None) -> list[str]:
         print("runner: ALLOWED_FILES must be a JSON array of non-empty strings; skipping enforcement", file=sys.stderr)
         return []
     return value
+
+
+def _ascii_fold(value: str) -> str:
+    return value.translate(str.maketrans(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"
+    ))
+
+
+def validate_release_asset_paths(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError("release_assets must be an array")
+    if len(value) > RELEASE_ASSETS_MAX_FILES:
+        raise ValueError(
+            f"release_assets has {len(value)} paths "
+            f"(max {RELEASE_ASSETS_MAX_FILES})"
+        )
+
+    seen_paths: set[str] = set()
+    seen_basenames: set[str] = set()
+    total_path_bytes = 0
+    for index, configured_path in enumerate(value):
+        where = f"release_assets[{index}]"
+        if not isinstance(configured_path, str) or not configured_path.strip():
+            raise ValueError(f"{where} must be a non-empty string")
+        if any(0xD800 <= ord(char) <= 0xDFFF for char in configured_path):
+            raise ValueError(f"{where} must not contain Unicode surrogates")
+        total_path_bytes += len(configured_path.encode("utf-8"))
+        if total_path_bytes > RELEASE_ASSETS_MAX_PATH_BYTES:
+            raise ValueError(
+                f"release_assets paths exceed {RELEASE_ASSETS_MAX_PATH_BYTES} "
+                "UTF-8 bytes"
+            )
+        if configured_path.startswith("/") or re.match(
+            r"^[A-Za-z]:", configured_path, re.ASCII
+        ):
+            raise ValueError(f"{where} must be relative")
+        if "\\" in configured_path:
+            raise ValueError(f"{where} must use '/' separators")
+        if any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F
+               for char in configured_path):
+            raise ValueError(f"{where} must not contain control characters")
+
+        segments = configured_path.split("/")
+        if any(segment in ("", ".", "..") for segment in segments):
+            raise ValueError(f"{where} has an invalid path segment")
+        if _ascii_fold(segments[0]) == ".git":
+            raise ValueError(f"{where} must not select the root .git tree")
+
+        basename = segments[-1]
+        folded_basename = _ascii_fold(basename)
+        if not RELEASE_ASSET_BASENAME.fullmatch(basename) or ".." in basename:
+            raise ValueError(f"{where} basename {basename!r} is not Release-safe")
+        if folded_basename in ("result.json", "release-body.md"):
+            raise ValueError(f"{where} basename {basename!r} is reserved")
+        if configured_path in seen_paths:
+            raise ValueError(f"{where} duplicates path {configured_path!r}")
+        if basename in seen_basenames:
+            raise ValueError(f"{where} duplicates basename {basename!r}")
+        seen_paths.add(configured_path)
+        seen_basenames.add(basename)
+    return list(value)
+
+
+def parse_release_assets(raw: str | None) -> list[str]:
+    if raw is None or not raw.strip():
+        return []
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("RELEASE_ASSETS is not valid JSON") from exc
+    return validate_release_asset_paths(value)
+
+
+def _workflow_warning(message: str) -> None:
+    escaped = "".join(
+        char if 0x20 <= ord(char) < 0x7F else f"\\u{ord(char):04x}"
+        for char in message
+    ).replace("%", "%25")
+    print(f"::warning::{escaped}")
+
+
+def open_release_asset_source(
+    workspace: pathlib.Path, configured_path: str
+) -> int:
+    """Open the configured leaf for reading WITHOUT following any symlink, and
+    return the pinned file descriptor. Every segment is opened with
+    O_NOFOLLOW/O_DIRECTORY so a symlink swapped onto a parent or the leaf after
+    validation (a student process double-forked during grading survives into
+    post-grade staging) is rejected at open time — closing the validate-then-
+    reopen TOCTOU. The returned fd is what _copy_release_asset reads from, so
+    the copy can never re-resolve the path against a mutated tree. Caller owns
+    closing the fd."""
+    validate_release_asset_paths([configured_path])
+    segments = configured_path.split("/")
+    dir_fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    leaf_fd = -1
+    try:
+        for index, segment in enumerate(segments):
+            is_leaf = index == len(segments) - 1
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+            if not is_leaf:
+                flags |= os.O_DIRECTORY
+            try:
+                next_fd = os.open(segment, flags, dir_fd=dir_fd)
+            except OSError as exc:
+                # O_NOFOLLOW rejects a symlink with ELOOP; O_DIRECTORY on a
+                # symlink-to-dir can surface as ENOTDIR first. lstat the segment
+                # (relative to the current dir fd, no follow) to report a
+                # symlinked segment precisely rather than as a plain non-dir.
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    try:
+                        seg_info = os.lstat(segment, dir_fd=dir_fd)
+                    except OSError:
+                        seg_info = None
+                    if seg_info is not None and stat.S_ISLNK(seg_info.st_mode):
+                        raise ValueError(
+                            f"{configured_path!r} contains a symlink"
+                        ) from exc
+                    if not is_leaf and exc.errno == errno.ENOTDIR:
+                        raise ValueError(
+                            f"{configured_path!r} has a non-directory parent"
+                        ) from exc
+                raise
+            if is_leaf:
+                info = os.fstat(next_fd)
+                if not stat.S_ISREG(info.st_mode):
+                    os.close(next_fd)
+                    raise ValueError(
+                        f"{configured_path!r} is not a regular file"
+                    )
+                leaf_fd = next_fd
+            else:
+                os.close(dir_fd)
+                dir_fd = next_fd
+        return leaf_fd
+    except BaseException:
+        if leaf_fd >= 0:
+            os.close(leaf_fd)
+        raise
+    finally:
+        os.close(dir_fd)
+
+
+def _copy_release_asset(
+    source_fd: int, destination: pathlib.Path, max_bytes: int
+) -> int:
+    """Copy from an already-open, symlink-free source fd (see
+    open_release_asset_source) to `destination`, capped at max_bytes. Reading
+    the pinned fd — never re-opening by path — is what makes this copy immune to
+    a symlink swapped in after validation."""
+    copied = 0
+    created = False
+    try:
+        with os.fdopen(source_fd, "rb", closefd=False) as input_file, \
+                destination.open("xb") as output_file:
+            created = True
+            while chunk := input_file.read(1024 * 1024):
+                if copied + len(chunk) > max_bytes:
+                    raise ValueError(
+                        f"{destination.name!r} exceeds the remaining byte budget"
+                    )
+                output_file.write(chunk)
+                copied += len(chunk)
+    except (OSError, ValueError):
+        if created:
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+    return copied
+
+
+def stage_release_assets(
+    workspace: pathlib.Path,
+    destination: pathlib.Path,
+    configured_paths: list[str],
+) -> list[str]:
+    configured_paths = validate_release_asset_paths(configured_paths)
+    try:
+        existing = destination.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if stat.S_ISDIR(existing.st_mode) and not stat.S_ISLNK(existing.st_mode):
+            shutil.rmtree(destination)
+        else:
+            destination.unlink()
+    destination.mkdir(parents=True)
+
+    accepted: list[str] = []
+    total = 0
+    for configured_path in configured_paths:
+        basename = configured_path.split("/")[-1]
+        target = destination / basename
+        copy_attempted = False
+        try:
+            try:
+                target.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise FileExistsError(
+                    f"release asset {basename!r} has a runtime destination collision"
+                )
+            source_fd = open_release_asset_source(workspace, configured_path)
+            copy_attempted = True
+            try:
+                copied = _copy_release_asset(
+                    source_fd, target, RELEASE_ASSETS_MAX_BYTES - total
+                )
+            finally:
+                os.close(source_fd)
+        except (OSError, ValueError) as exc:
+            if copy_attempted:
+                try:
+                    target.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            _workflow_warning(f"release_assets: {configured_path!r} skipped ({exc})")
+            continue
+        total += copied
+        accepted.append(basename)
+    return accepted
+
+
+def _stage_release_assets_and_emit(
+    workspace: pathlib.Path, github_output: str | None, rc: int
+) -> int:
+    """Stage the configured release assets after grading and emit the staged
+    dir + accepted basenames + skipped count to $GITHUB_OUTPUT. Fail-open: any
+    staging error only warns and never changes `rc` (the grade result). Split
+    out of main() so the staging/output contract the workflow upload step
+    depends on is unit-testable without the full grading pipeline."""
+    accepted_assets: list[str] = []
+    configured_asset_count = 0
+    staging_dir = (
+        pathlib.Path(
+            os.environ.get("RUNNER_TEMP")
+            or tempfile.mkdtemp(prefix="classroom50-")
+        )
+        / RELEASE_ASSETS_DIRNAME
+    )
+    try:
+        configured_paths = parse_release_assets(os.environ.get("RELEASE_ASSETS"))
+        configured_asset_count = len(configured_paths)
+        accepted_assets = stage_release_assets(
+            workspace, staging_dir, configured_paths
+        )
+    except (OSError, ValueError) as exc:
+        _workflow_warning(f"release_assets: staging disabled ({exc})")
+
+    skipped = configured_asset_count - len(accepted_assets)
+    if skipped > 0:
+        # Machine-readable signal so a teacher can tell a fully-published
+        # Release from a partial one without scraping ::warning:: annotations.
+        print(
+            f"::notice::release_assets: attached {len(accepted_assets)} of "
+            f"{configured_asset_count} configured file(s); {skipped} skipped"
+        )
+
+    if github_output:
+        try:
+            with open(github_output, "a") as output:
+                # release-assets-dir is the absolute staged dir the workflow
+                # upload step reads (see STAGED_RELEASE_DIR in the workflow).
+                output.write(f"release-assets={','.join(accepted_assets)}\n")
+                output.write(f"release-assets-dir={staging_dir}\n")
+                output.write(f"release-assets-skipped={skipped}\n")
+        except OSError as exc:
+            _workflow_warning(f"release_assets: could not emit staged names ({exc})")
+    return rc
 
 
 def _isolated_git_env() -> dict[str, str]:
@@ -841,14 +1133,19 @@ def render_removed_files_note(removed: list[str]) -> str:
 
 
 def append_removed_files_note(workspace: pathlib.Path, removed: list[str]) -> None:
-    """Append the removed-files note to release-body.md. Best-effort: a
-    missing body or write error must not fail the grade."""
+    """Append the removed-files note to release-body.md. Runs in main()'s
+    finally, before the final body is mirrored to the Summary page, so the note
+    reaches both surfaces without a second write here. Best-effort: a missing
+    body or write error must not fail the grade. errors="replace" guards against
+    a custom autograder's non-UTF-8 body (UnicodeDecodeError is a ValueError,
+    not an OSError, so a strict read would escape the except and crash a run)."""
     if not removed:
         return
+    note = render_removed_files_note(removed)
     body_path = workspace / RELEASE_BODY_FILENAME
     try:
-        existing = body_path.read_text() if body_path.exists() else ""
-        body_path.write_text(existing + render_removed_files_note(removed))
+        existing = body_path.read_text(encoding="utf-8", errors="replace") if body_path.exists() else ""
+        body_path.write_text(existing + note)
     except OSError as exc:
         print(f"runner: could not append removed-files note to {RELEASE_BODY_FILENAME}: {exc}", file=sys.stderr)
 
@@ -866,7 +1163,7 @@ def no_baseline_warning(source: str = SOURCE_NONE) -> str:
     if source == SOURCE_GIT_ERROR:
         return (
             f"{prefix}could not read git history to resolve the Feedback PR "
-            "baseline; a baseline may exist but git could not read it (e.g. a "
+            "baseline; a baseline may exist but git could not read it (e.g., a "
             "container's 'dubious ownership' guard). The Feedback PR step will "
             "skip. See the runner log above for the git error."
         )
@@ -1025,7 +1322,7 @@ def commit_submitted_at(sha: str, workspace: pathlib.Path) -> datetime.datetime:
     if not raw:
         return now_utc()
     try:
-        # %cI is strict ISO-8601 with an offset (e.g. 2026-06-30T12:00:00+01:00).
+        # %cI is strict ISO-8601 with an offset (e.g., 2026-06-30T12:00:00+01:00).
         parsed = datetime.datetime.fromisoformat(raw)
     except ValueError:
         return now_utc()
@@ -1185,6 +1482,19 @@ def _clip(text: str | None) -> str:
     return text
 
 
+def _unified_diff(expected: str, actual: str) -> str:
+    """Unified diff of expected vs actual stdout for a failed exact-comparison
+    io test. A diff pinpoints the divergent line; the raw side-by-side blocks
+    it replaces made students eyeball-compare up to 2000 chars each. Inputs
+    are stripped to mirror compare_output's exact semantics, so the diff never
+    flags leading/trailing whitespace the comparison ignores."""
+    lines = difflib.unified_diff(
+        expected.strip().splitlines(), actual.strip().splitlines(),
+        fromfile="expected", tofile="actual stdout", lineterm="",
+    )
+    return _clip("\n".join(lines))
+
+
 def _fence(text: str) -> str:
     """A backtick fence longer than any backtick run inside `text`, so student
     output containing ``` can't break out of the code block and inject Markdown
@@ -1339,7 +1649,7 @@ def _grade_python(spec: dict[str, Any], cwd: pathlib.Path, timeout: int,
         return _make_outcome(name, points, passed, detail, score=score)
 
     # Fallback: no parseable report -> all-or-nothing on the exit code
-    # (e.g. an offline runner couldn't load pytest-json-report).
+    # (e.g., an offline runner couldn't load pytest-json-report).
     passed = rp.returncode == 0
     detail = (f"pytest exit {rp.returncode} "
               f"(no JSON report from pytest-json-report; scored on exit code)")
@@ -1400,8 +1710,19 @@ def execute_test(spec: dict[str, Any], *, cwd: pathlib.Path,
         return _make_outcome(name, points, False, f"invalid regex in expected: {exc}")
     detail = f"exit {rp.returncode}; comparison={comparison}"
     if not passed:
-        detail += (f"\n--- expected ({comparison}) ---\n{_clip(expected)}"
-                   f"\n--- actual stdout ---\n{_clip(rp.stdout)}")
+        # A line diff only makes sense against a full expected output, and only
+        # for exact: for included/regex the expectation is a fragment or
+        # pattern, so those keep the verbatim expected/actual blocks. The exact
+        # comparison also sees separator characters splitlines() folds away
+        # (\x0c, \x85, \u2028, a literal \r in an inline expected), so a failing
+        # exact test can yield an empty diff — fall back to the same verbatim
+        # blocks rather than show FAIL with no explanation.
+        diff = _unified_diff(expected, rp.stdout) if comparison == COMPARISON_EXACT else ""
+        if diff:
+            detail += f"\n{diff}"
+        else:
+            detail += (f"\n--- expected ({comparison}) ---\n{_clip(expected)}"
+                       f"\n--- actual stdout ---\n{_clip(rp.stdout)}")
         if rp.stderr.strip():
             detail += f"\n--- stderr ---\n{_clip(rp.stderr)}"
     return _make_outcome(name, points, passed, detail)
@@ -1415,6 +1736,11 @@ def _validate_test_spec(t: Any) -> str | None:
     name = t.get("name")
     if not isinstance(name, str) or not name:
         return "name must be a non-empty string"
+    # Mirror tests.go / tests-v1.schema.json: names are echoed into the release
+    # body and, since the log report, into a column-0 `::group::FAIL: {name}`
+    # line — a control char there could inject a workflow command.
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in name):
+        return "name must not contain control characters"
     if t.get("type") not in TEST_TYPES:
         return f"type {t.get('type')!r} must be one of {list(TEST_TYPES)}"
     if not isinstance(t.get("run"), str) or not t.get("run"):
@@ -1497,6 +1823,90 @@ def render_declarative_body(result: dict[str, Any], outcomes: list[dict[str, Any
 
     lines.append(f"Status: {summary}")
     return "\n".join(lines) + "\n"
+
+
+def _colorize(text: str, code: str, *, color: bool) -> str:
+    """Wrap `text` in an ANSI code, or return it untouched when color is off."""
+    if not color:
+        return text
+    return f"{code}{text}{ANSI_RESET}"
+
+
+def _strip_control_chars(text: str) -> str:
+    """Drop ASCII control chars (incl. newlines) so a name can't inject a
+    column-0 workflow command into the log report. Mirrors tests.go's
+    no-control-chars rule as a defense-in-depth backstop to _validate_test_spec."""
+    return "".join(c for c in text if ord(c) >= 0x20 and ord(c) != 0x7f)
+
+
+def render_log_report(outcomes: list[dict[str, Any]], *, color: bool) -> str:
+    """Per-test report for the workflow log: a PASS/FAIL line per test, then
+    one collapsible ::group:: per failing test with its captured detail.
+    Failures only get groups — folding every passing test would bury the red
+    ones. The release body carries the same data as Markdown; this is the
+    log-surface rendering (ANSI is fine here, Markdown tables are not).
+
+    Detail lines are indented two spaces: detail carries student-controlled
+    program output, and GitHub only interprets workflow commands (::error::,
+    ::endgroup::, ::stop-commands::) at column 0 — the indent makes command
+    injection impossible. This is the log-surface analogue of _fence on the
+    Markdown surface.
+    """
+    lines = []
+    for o in outcomes:
+        name = _strip_control_chars(o["test-name"])
+        if o["passed"]:
+            verdict = _colorize("PASS", ANSI_GREEN, color=color)
+        else:
+            verdict = _colorize("FAIL", ANSI_BOLD + ANSI_RED, color=color)
+        lines.append(f"{verdict}  {name}  ({o['score']}/{o['max-score']})")
+
+    for o in outcomes:
+        if o["passed"]:
+            continue
+        # test-name lands at column 0 in the group header; _validate_test_spec
+        # already rejects control chars, but strip here too so a name can never
+        # inject a workflow command even if it reached this renderer some other
+        # way (mirrors the two-space indent that defends the detail lines).
+        lines.append(f"::group::FAIL: {_strip_control_chars(o['test-name'])}")
+        for dl in (o.get("detail") or "").rstrip().splitlines():
+            if dl.startswith("+"):
+                dl = _colorize(dl, ANSI_GREEN, color=color)
+            elif dl.startswith("-"):
+                dl = _colorize(dl, ANSI_RED, color=color)
+            elif dl.startswith("@@"):
+                dl = _colorize(dl, ANSI_CYAN, color=color)
+            lines.append(f"  {dl}")
+        lines.append("::endgroup::")
+    return "\n".join(lines) + "\n"
+
+
+def append_step_summary(markdown: str) -> None:
+    """Append Markdown to the workflow run's Summary page ($GITHUB_STEP_SUMMARY).
+    Best-effort: the summary is a convenience surface, so an unset var (local
+    runs, tests) or a write failure must never affect the grading outcome."""
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(markdown)
+    except OSError:
+        pass
+
+
+def mirror_body_to_step_summary(workspace: pathlib.Path) -> None:
+    """Mirror the final release-body.md to the run's Summary page. Called once
+    from main()'s finally so every exit path (declarative grade, custom
+    autograder, infrastructure error, vacuous pass) surfaces the same body the
+    release carries. errors="replace": a custom autograder may write arbitrary
+    bytes, and a decode error must never crash a graded run (UnicodeDecodeError
+    is a ValueError, not an OSError, so the read is guarded too)."""
+    body_path = workspace / RELEASE_BODY_FILENAME
+    try:
+        append_step_summary(body_path.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        pass
 
 
 class DeclarativeGrader:
@@ -1594,10 +2004,16 @@ def run_declarative(tests_path: pathlib.Path, finalize: Finalizer,
         return finalize.error(f"declarative grader produced invalid result: {err}")
 
     status, summary = derive_status_and_summary(result)
+    # Failure details used to live only in the release body, forcing a
+    # detour from the (natural) Actions log to the release to see why a
+    # test failed. Print the per-test report to the log too, ANSI-colored
+    # only under Actions so pytest-captured and local output stay clean.
+    color = os.environ.get("GITHUB_ACTIONS") == "true" and "NO_COLOR" not in os.environ
+    print(render_log_report(outcomes, color=color), end="")
     print(f"runner: {summary}")
     (finalize.workspace / RESULT_FILENAME).write_text(json.dumps(result, indent=2) + "\n")
-    (finalize.workspace / RELEASE_BODY_FILENAME).write_text(
-        render_declarative_body(result, outcomes, summary))
+    body = render_declarative_body(result, outcomes, summary)
+    (finalize.workspace / RELEASE_BODY_FILENAME).write_text(body)
     append_outputs(finalize.github_output, status, summary)
     return 0
 
@@ -1759,7 +2175,8 @@ def finalize_result(finalize: Finalizer, *, is_group: bool) -> int:
     if err is not None:
         return finalize.error(err)
 
-    # Synthesize release-body.md if the autograder didn't write one.
+    # Synthesize release-body.md if the autograder didn't write one. main()'s
+    # finally mirrors the final body to the Summary page on every exit path.
     body_path = workspace / RELEASE_BODY_FILENAME
     if not body_path.is_file():
         _, fallback = derive_status_and_summary(result)
@@ -1939,7 +2356,15 @@ def main() -> int:
         rc = _grade()
     finally:
         append_removed_files_note(workspace, removed_files)
-    return rc
+        # Mirror the FINAL release body to the run's Summary page from here —
+        # the one point every exit path (success, error, vacuous pass) passes
+        # through, after the removed-files note has been folded in. Doing it
+        # here (not in run_declarative / finalize_result / the note) keeps the
+        # Summary a faithful mirror of release-body.md on all paths; the error
+        # and vacuous-pass paths previously wrote a body no surface mirrored.
+        mirror_body_to_step_summary(workspace)
+
+    return _stage_release_assets_and_emit(workspace, github_output, rc)
 
 
 if __name__ == "__main__":
