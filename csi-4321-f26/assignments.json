@@ -1,4 +1,16 @@
 {
   "schema": "classroom50/assignments/v1",
-  "assignments": []
+  "assignments": [
+    {
+      "slug": "project0",
+      "name": "Project 0",
+      "template": {
+        "owner": "CSI-4321-Data-Communications",
+        "repo": "Project0",
+        "branch": "main"
+      },
+      "mode": "individual",
+      "autograder": "project0"
+    }
+  ]
 }
