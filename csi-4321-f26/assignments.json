@@ -55,6 +55,17 @@
       },
       "mode": "individual",
       "autograder": "default"
+    },
+    {
+      "slug": "finalproject",
+      "name": "Final Project",
+      "template": {
+        "owner": "CSI-4321-Data-Communications",
+        "repo": "FinalProject",
+        "branch": "main"
+      },
+      "mode": "individual",
+      "autograder": "default"
     }
   ]
 }
