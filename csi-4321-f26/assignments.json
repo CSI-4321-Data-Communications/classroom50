@@ -2,17 +2,6 @@
   "schema": "classroom50/assignments/v1",
   "assignments": [
     {
-      "slug": "project1",
-      "name": "Project 1",
-      "template": {
-        "owner": "CSI-4321-Data-Communications",
-        "repo": "Project1",
-        "branch": "main"
-      },
-      "mode": "individual",
-      "autograder": "default"
-    },
-    {
       "slug": "project2",
       "name": "Project 2",
       "template": {
@@ -81,6 +70,18 @@
         "offset": "-05:00",
         "source": "auto-detected"
       }
+    },
+    {
+      "slug": "project1",
+      "name": "Project 1",
+      "template": {
+        "owner": "CSI-4321-Data-Communications",
+        "repo": "Project1",
+        "branch": "main"
+      },
+      "mode": "individual",
+      "autograder": "default",
+      "locked": true
     }
   ]
 }
