@@ -35,17 +35,6 @@
       "autograder": "default"
     },
     {
-      "slug": "finalproject",
-      "name": "Final Project",
-      "template": {
-        "owner": "CSI-4321-Data-Communications",
-        "repo": "FinalProject",
-        "branch": "main"
-      },
-      "mode": "individual",
-      "autograder": "default"
-    },
-    {
       "slug": "project0",
       "name": "Project 0",
       "mode": "individual",
@@ -82,6 +71,26 @@
       "mode": "individual",
       "autograder": "default",
       "locked": true
+    },
+    {
+      "slug": "finalproject",
+      "name": "Final Project",
+      "mode": "group",
+      "autograder": "default",
+      "feedback_pr": true,
+      "template": {
+        "owner": "CSI-4321-Data-Communications",
+        "repo": "FinalProject",
+        "branch": "main"
+      },
+      "due": "2026-12-12T18:15:00Z",
+      "due_meta": {
+        "input": "2026-12-12T12:15:00",
+        "zone": "America/Chicago",
+        "offset": "-06:00",
+        "source": "auto-detected"
+      },
+      "max_group_size": 3
     }
   ]
 }
