@@ -14,6 +14,13 @@ so the teacher reviews the full starter->latest diff with inline comments, and
 it auto-updates on every submission. PRs opened by GITHUB_TOKEN don't retrigger
 workflows, so there's no loop.
 
+Since issue #228 the accept clients (gh student accept / the web GUI) create
+the PR at accept time with the student's own token — same base/head, title,
+labels, and body (byte-mirrored via cli/shared/contract) — so it exists even
+with Actions disabled. find_pr matches by base+head only, so this script
+ADOPTS that PR; this create path remains the fallback for pre-feature repos
+and accepts whose best-effort PR step failed.
+
 Behavior (ported verbatim from the former inline bash):
   1. Freeze the base: create the `feedback` branch at BASE_SHA once, never
      advance it. If it already exists at a DIFFERENT sha, a student may have
@@ -196,7 +203,8 @@ def pr_body(head: str, release_url: str) -> str:
     """
     return "\n".join([
         ":wave:! Classroom 50 opened this pull request as a place for your "
-        "teacher to leave feedback on your work. It updates automatically. "
+        "teacher to leave feedback on your work. It stays up to date "
+        "automatically as you push. "
         "**Don't close or merge this pull request** unless your teacher tells you to.",
         "",
         f"Each commit is automatically graded — the latest autograding result "
@@ -225,8 +233,8 @@ def pr_body(head: str, release_url: str) -> str:
         "comment box below.",
         "",
         f"The base branch (`{BASE_BRANCH}`) is frozen at the starter so the diff "
-        f"always reflects the full body of work. The PR is managed automatically "
-        f"by the autograde runner; merging it is the teacher-side "
+        f"always reflects the full body of work. The PR is kept up to date "
+        f"automatically; merging it is the teacher-side "
         f"\"grading done\" signal.",
         "</details>",
     ])
