@@ -2,17 +2,6 @@
   "schema": "classroom50/assignments/v1",
   "assignments": [
     {
-      "slug": "project0",
-      "name": "Project 0",
-      "template": {
-        "owner": "CSI-4321-Data-Communications",
-        "repo": "Project0",
-        "branch": "main"
-      },
-      "mode": "individual",
-      "autograder": "project0"
-    },
-    {
       "slug": "project1",
       "name": "Project 1",
       "template": {
@@ -66,6 +55,32 @@
       },
       "mode": "individual",
       "autograder": "default"
+    },
+    {
+      "slug": "project0",
+      "name": "Project 0",
+      "mode": "individual",
+      "autograder": "default",
+      "feedback_pr": true,
+      "template": {
+        "owner": "CSI-4321-Data-Communications",
+        "repo": "Project0",
+        "branch": "main"
+      },
+      "due": "2026-08-29T04:59:00Z",
+      "due_meta": {
+        "input": "2026-08-28T23:59:00",
+        "zone": "America/Chicago",
+        "offset": "-05:00",
+        "source": "auto-detected"
+      },
+      "available_from": "2026-08-05T15:29:00Z",
+      "available_from_meta": {
+        "input": "2026-08-05T10:29:00",
+        "zone": "America/Chicago",
+        "offset": "-05:00",
+        "source": "auto-detected"
+      }
     }
   ]
 }
