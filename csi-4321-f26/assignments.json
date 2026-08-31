@@ -91,6 +91,25 @@
         "source": "auto-detected"
       },
       "max_group_size": 3
+    },
+    {
+      "slug": "udp-demo",
+      "name": "UDP-demo",
+      "mode": "individual",
+      "autograder": "default",
+      "feedback_pr": false,
+      "no_autograder": true,
+      "copy_about": true,
+      "copy_topics": true,
+      "template": {
+        "owner": "CSI-4321-Data-Communications",
+        "repo": "UDP-demo",
+        "branch": "main"
+      },
+      "description": "This is for a walkthrough in class. This isn't graded.",
+      "grading": {
+        "mode": "off"
+      }
     }
   ]
 }
