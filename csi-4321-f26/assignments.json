@@ -98,6 +98,26 @@
       "grading": {
         "mode": "off"
       }
+    },
+    {
+      "slug": "project-3",
+      "name": "Project 3",
+      "mode": "team",
+      "autograder": "default",
+      "feedback_pr": true,
+      "no_autograder": true,
+      "copy_about": true,
+      "copy_topics": true,
+      "template": {
+        "owner": "CSI-4321-Data-Communications",
+        "repo": "Project3",
+        "branch": "main"
+      },
+      "max_group_size": 4,
+      "team_formation": "teacher",
+      "grading": {
+        "mode": "off"
+      }
     }
   ]
 }
