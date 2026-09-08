@@ -107,6 +107,26 @@
       "grading": {
         "mode": "off"
       }
+    },
+    {
+      "slug": "final-project",
+      "name": "Final Project",
+      "mode": "team",
+      "autograder": "default",
+      "feedback_pr": true,
+      "no_autograder": true,
+      "copy_about": true,
+      "copy_topics": true,
+      "template": {
+        "owner": "CSI-4321-Data-Communications",
+        "repo": "FinalProject",
+        "branch": "main"
+      },
+      "max_group_size": 4,
+      "team_formation": "teacher",
+      "grading": {
+        "mode": "off"
+      }
     }
   ]
 }
