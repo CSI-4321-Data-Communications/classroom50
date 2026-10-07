@@ -38,6 +38,44 @@
           "formation": "teacher"
         }
       ]
+    },
+    "project-4": {
+      "teams": [
+        {
+          "slug": "classroom50-group-882a915e6835789e-1",
+          "id": 19967380,
+          "name": "Group1",
+          "members": [
+            "jonahb023",
+            "jaackfont05",
+            "cgriffin0"
+          ],
+          "formation": "teacher"
+        },
+        {
+          "slug": "classroom50-group-882a915e6835789e-2",
+          "id": 19967381,
+          "name": "Group2",
+          "members": [
+            "lademiaromolaran",
+            "adam-deslatte1",
+            "Mcscout05",
+            "Chaymae2006"
+          ],
+          "formation": "teacher"
+        },
+        {
+          "slug": "classroom50-group-882a915e6835789e-3",
+          "id": 19967384,
+          "name": "Group3",
+          "members": [
+            "bvowell2005",
+            "RyanLimprecht1",
+            "DiazBaylor"
+          ],
+          "formation": "teacher"
+        }
+      ]
     }
   }
 }
